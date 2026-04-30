@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.pytest_cache/
+
+# Backend data
+backend/data/*.db
+backend/data/uploads/*
+!backend/data/uploads/.gitkeep
+backend/data/index/*
+!backend/data/index/.gitkeep
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+
+# IDE
+.vscode/
