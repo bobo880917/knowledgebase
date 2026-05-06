@@ -99,6 +99,7 @@ export type JobItem = {
   progress_current: number | null;
   progress_total: number | null;
   message: string;
+  target_name?: string | null;
   result_json: string;
   error: string;
   retry_count: number;

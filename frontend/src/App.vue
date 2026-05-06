@@ -135,6 +135,9 @@ async function refreshJobs() {
     if (!jobs.value.length) {
       selectedJobId.value = null;
     }
+    if (lastCreatedJobId.value != null && !jobs.value.some((job) => job.id === lastCreatedJobId.value)) {
+      lastCreatedJobId.value = null;
+    }
   } catch (err) {
     jobsError.value = err instanceof Error ? err.message : '读取任务失败';
   } finally {
@@ -312,12 +315,46 @@ function jobTypeLabel(job: JobItem) {
   return job.type;
 }
 
+function jobPrimaryText(job: JobItem) {
+  if (job.type === 'import_document') {
+    return job.target_name ? `导入：${job.target_name}` : '文档导入';
+  }
+  return jobTypeLabel(job);
+}
+
+function jobSecondaryText(job: JobItem) {
+  if (job.status === 'failed') {
+    return job.error || '执行失败';
+  }
+  if (job.type === 'import_document') {
+    if (job.status === 'succeeded') return '导入完成';
+    if (job.status === 'queued') return '等待执行…';
+    if (job.status === 'running') return job.message || '执行中…';
+  }
+  if (job.type === 'reindex_project') {
+    if (job.status === 'succeeded') return '重建完成';
+    if (job.status === 'queued') return '等待执行…';
+    if (job.status === 'running') return job.message || '执行中…';
+  }
+  if (job.message && !['执行失败', '导入完成', '重建完成'].includes(job.message)) return job.message;
+  return '';
+}
+
 function statusClass(job: JobItem) {
   return `status-${job.status}`;
 }
 
 function selectJob(job: JobItem) {
   selectedJobId.value = job.id;
+  if (lastCreatedJobId.value === job.id) {
+    lastCreatedJobId.value = null;
+  }
+}
+
+function jobSeq(job: JobItem) {
+  const index = jobs.value.findIndex((item) => item.id === job.id);
+  if (index < 0) return null;
+  return (jobsPage.value - 1) * jobsPageSize + index + 1;
 }
 
 function upsertJob(job: JobItem) {
@@ -733,8 +770,8 @@ onBeforeUnmount(() => {
                 @click="selectJob(job)"
               >
                 <span class="job-row-main">
-                  <strong>#{{ job.id }} · {{ jobTypeLabel(job) }}</strong>
-                  <small>{{ job.message || '暂无进度信息' }}</small>
+                  <strong>No.{{ jobSeq(job) ?? '-' }} · {{ jobPrimaryText(job) }}</strong>
+                  <small>{{ jobSecondaryText(job) || '—' }}</small>
                 </span>
                 <span class="job-row-side">
                   <b class="status-pill" :class="statusClass(job)">{{ jobBadge(job) }}</b>
@@ -759,12 +796,13 @@ onBeforeUnmount(() => {
               <div class="document-head">
                 <div>
                   <span class="muted">任务详情</span>
-                  <h3>#{{ selectedJob.id }} · {{ jobTypeLabel(selectedJob) }}</h3>
+                  <h3>No.{{ jobSeq(selectedJob) ?? '-' }} · {{ jobPrimaryText(selectedJob) }}</h3>
+                  <small class="muted">ID {{ selectedJob.id }}</small>
                 </div>
                 <b class="status-pill" :class="statusClass(selectedJob)">{{ jobBadge(selectedJob) }}</b>
               </div>
 
-              <p class="muted">{{ selectedJob.message || '暂无进度信息' }}</p>
+              <p class="muted">{{ jobSecondaryText(selectedJob) || selectedJob.message || '—' }}</p>
               <div class="progress-track">
                 <span :style="{ width: `${progressPercent(selectedJob)}%` }"></span>
               </div>

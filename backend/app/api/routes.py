@@ -2,6 +2,8 @@ import sqlite3
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
+import json
+
 from app.schemas import (
     CreateJobResponse,
     EmbeddingHealth,
@@ -116,6 +118,19 @@ def create_reindex_job(req: ReindexJobCreate) -> CreateJobResponse:
     return CreateJobResponse(job_id=res.job_id)
 
 
+def _job_out_from_row(row) -> JobOut:
+    data = dict(row)
+    target_name = None
+    try:
+        params = json.loads(data.get("params_json") or "{}")
+        if data.get("type") == "import_document":
+            target_name = params.get("original_filename")
+    except Exception:
+        target_name = None
+    data["target_name"] = target_name
+    return JobOut(**data)
+
+
 @router.get("/jobs", response_model=JobListResponse)
 def list_jobs(
     project_id: int = Query(default=1, ge=1),
@@ -125,7 +140,7 @@ def list_jobs(
     _ensure_project(project_id)
     rows, total = job_service.list_jobs(project_id, limit, offset)
     return JobListResponse(
-        items=[JobOut(**dict(r)) for r in rows],
+        items=[_job_out_from_row(r) for r in rows],
         total=total,
         limit=limit,
         offset=offset,
@@ -137,7 +152,7 @@ def get_job(job_id: int) -> JobOut:
     row = job_service.get_job(job_id)
     if not row:
         raise HTTPException(status_code=404, detail="任务不存在")
-    return JobOut(**dict(row))
+    return _job_out_from_row(row)
 
 
 @router.post("/jobs/{job_id}/cancel")

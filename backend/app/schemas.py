@@ -15,6 +15,7 @@ class JobOut(BaseModel):
     progress_current: int | None = None
     progress_total: int | None = None
     message: str
+    target_name: str | None = None
     result_json: str
     error: str
     retry_count: int

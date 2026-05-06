@@ -105,22 +105,32 @@ class JobService:
     def retry_job(self, job_id: int) -> int | None:
         with get_db() as conn:
             row = conn.execute(
-                "SELECT project_id, type, status, params_json, retry_count FROM jobs WHERE id = ?",
+                "SELECT status, retry_count FROM jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             if not row:
                 return None
             if row["status"] != "failed":
                 raise ValueError("仅 failed 任务允许重试")
-            params = _safe_json_loads(row["params_json"], default={})
-            new_job_id = self._create_job_row(
-                project_id=int(row["project_id"]),
-                job_type=row["type"],
-                params=params,
-                retry_count=int(row["retry_count"]) + 1,
+
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued',
+                    progress_current = NULL,
+                    progress_total = NULL,
+                    message = '已重试，等待执行…',
+                    result_json = '',
+                    error = '',
+                    retry_count = ?,
+                    cancel_requested = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (int(row["retry_count"]) + 1, job_id),
             )
-        self._submit(new_job_id)
-        return new_job_id
+        self._submit(job_id)
+        return job_id
 
     def list_jobs(self, project_id: int, limit: int = 20, offset: int = 0) -> tuple[list[sqlite3.Row], int]:
         with get_db() as conn:
