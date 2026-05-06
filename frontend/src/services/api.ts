@@ -87,6 +87,33 @@ export type ProviderHealth = {
   message: string;
 };
 
+export type CreateJobResponse = {
+  job_id: number;
+};
+
+export type JobItem = {
+  id: number;
+  project_id: number;
+  type: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  progress_current: number | null;
+  progress_total: number | null;
+  message: string;
+  result_json: string;
+  error: string;
+  retry_count: number;
+  cancel_requested: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type JobListResponse = {
+  items: JobItem[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
   if (!response.ok) {
@@ -137,6 +164,44 @@ export function uploadDocument(file: File, projectId: number): Promise<UploadRes
   return request<UploadResult>('/api/documents', {
     method: 'POST',
     body: form,
+  });
+}
+
+export function createImportJob(file: File, projectId: number): Promise<CreateJobResponse> {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('project_id', String(projectId));
+  return request<CreateJobResponse>('/api/jobs/import', {
+    method: 'POST',
+    body: form,
+  });
+}
+
+export function createReindexJob(projectId: number): Promise<CreateJobResponse> {
+  return request<CreateJobResponse>('/api/jobs/reindex', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId }),
+  });
+}
+
+export function listJobs(projectId: number, limit = 10, offset = 0): Promise<JobListResponse> {
+  return request<JobListResponse>(`/api/jobs?project_id=${projectId}&limit=${limit}&offset=${offset}`);
+}
+
+export function getJob(jobId: number): Promise<JobItem> {
+  return request<JobItem>(`/api/jobs/${jobId}`);
+}
+
+export function cancelJob(jobId: number): Promise<{ cancelled: boolean }> {
+  return request<{ cancelled: boolean }>(`/api/jobs/${jobId}/cancel`, {
+    method: 'POST',
+  });
+}
+
+export function retryJob(jobId: number): Promise<CreateJobResponse> {
+  return request<CreateJobResponse>(`/api/jobs/${jobId}/retry`, {
+    method: 'POST',
   });
 }
 

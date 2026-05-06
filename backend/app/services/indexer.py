@@ -3,6 +3,8 @@ from pathlib import Path
 
 from fastapi import UploadFile
 
+from collections.abc import Callable
+
 from app.core.config import get_settings
 from app.schemas import DocumentOut, ProjectIndexStats, ReindexResult, UploadResult
 from app.services.embeddings import EmbeddingService
@@ -11,18 +13,38 @@ from app.services.text_utils import chunk_text, summarize_text
 from app.storage.database import get_db
 
 
+class CancelledError(RuntimeError):
+    pass
+
+
+ProgressCallback = Callable[[str, int | None, int | None], None]
+CancelChecker = Callable[[], bool]
+
+
 class DocumentIndexer:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.embedding = EmbeddingService()
 
-    async def ingest_upload(self, file: UploadFile, project_id: int) -> UploadResult:
+    async def ingest_upload(
+        self,
+        file: UploadFile,
+        project_id: int,
+        *,
+        job_id: int | None = None,
+        progress_cb: ProgressCallback | None = None,
+        should_cancel: CancelChecker | None = None,
+    ) -> UploadResult:
         original_name = file.filename or "untitled"
         suffix = Path(original_name).suffix.lower()
         if suffix not in SUPPORTED_EXTENSIONS:
             supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
             raise ValueError(f"暂不支持 {suffix or '无扩展名'} 文件，当前支持：{supported}")
 
+        if job_id:
+            self._update_job_progress(job_id, "读取文件…", None, None)
+        elif progress_cb:
+            progress_cb("读取文件…", None, None)
         content = await file.read()
         raw_content_hash = hashlib.sha256(content).hexdigest()
         content_hash = hashlib.sha256(f"{project_id}:{raw_content_hash}".encode("utf-8")).hexdigest()
@@ -47,7 +69,28 @@ class DocumentIndexer:
                     chunk_count=self._count(conn, "chunks", existing["id"]),
                 )
 
+        if job_id:
+            self._update_job_progress(job_id, "解析文档结构…", None, None)
+        elif progress_cb:
+            progress_cb("解析文档结构…", None, None)
         sections = parse_document(target)
+
+        if should_cancel and should_cancel():
+            raise CancelledError("cancel_requested")
+
+        if job_id:
+            self._update_job_progress(job_id, "统计切片数量…", None, None)
+        elif progress_cb:
+            progress_cb("统计切片数量…", None, None)
+        expected_sections = len(sections)
+        expected_paragraphs = sum(len(section.paragraphs) for section in sections)
+        expected_chunks = 0
+        for section in sections:
+            for paragraph in section.paragraphs:
+                expected_chunks += len(chunk_text(paragraph))
+        expected_embeddings = expected_sections + expected_paragraphs + expected_chunks
+        embedded_so_far = 0
+
         document_summary = summarize_text(" ".join(p for s in sections for p in s.paragraphs), 260)
 
         with get_db() as conn:
@@ -64,6 +107,9 @@ class DocumentIndexer:
             chunk_count = 0
 
             for section_index, section in enumerate(sections):
+                if should_cancel and (section_index % 10 == 0) and should_cancel():
+                    raise CancelledError("cancel_requested")
+
                 section_summary = summarize_text(" ".join(section.paragraphs), 220)
                 section_cursor = conn.execute(
                     """
@@ -75,8 +121,22 @@ class DocumentIndexer:
                 section_id = int(section_cursor.lastrowid)
                 section_count += 1
                 self._insert_embedding(conn, "section", section_id, f"{section.title}\n{section_summary}")
+                embedded_so_far += 1
+                if job_id and (embedded_so_far % 20 == 0 or embedded_so_far == expected_embeddings):
+                    self._update_job_progress_conn(
+                        conn,
+                        job_id,
+                        "生成 embeddings（章节/段落/切片）…",
+                        embedded_so_far,
+                        expected_embeddings,
+                    )
+                elif progress_cb and (embedded_so_far % 20 == 0 or embedded_so_far == expected_embeddings):
+                    progress_cb("生成 embeddings（章节/段落/切片）…", embedded_so_far, expected_embeddings)
 
                 for paragraph_index, paragraph in enumerate(section.paragraphs):
+                    if should_cancel and (paragraph_index % 20 == 0) and should_cancel():
+                        raise CancelledError("cancel_requested")
+
                     paragraph_summary = summarize_text(paragraph, 180)
                     paragraph_cursor = conn.execute(
                         """
@@ -88,6 +148,17 @@ class DocumentIndexer:
                     paragraph_id = int(paragraph_cursor.lastrowid)
                     paragraph_count += 1
                     self._insert_embedding(conn, "paragraph", paragraph_id, f"{section.title}\n{paragraph_summary}")
+                    embedded_so_far += 1
+                    if job_id and (embedded_so_far % 20 == 0 or embedded_so_far == expected_embeddings):
+                        self._update_job_progress_conn(
+                            conn,
+                            job_id,
+                            "生成 embeddings（章节/段落/切片）…",
+                            embedded_so_far,
+                            expected_embeddings,
+                        )
+                    elif progress_cb and (embedded_so_far % 20 == 0 or embedded_so_far == expected_embeddings):
+                        progress_cb("生成 embeddings（章节/段落/切片）…", embedded_so_far, expected_embeddings)
 
                     for text_chunk in chunk_text(paragraph):
                         chunk_cursor = conn.execute(
@@ -100,6 +171,17 @@ class DocumentIndexer:
                         chunk_id = int(chunk_cursor.lastrowid)
                         chunk_count += 1
                         self._insert_embedding(conn, "chunk", chunk_id, f"{section.title}\n{text_chunk}")
+                        embedded_so_far += 1
+                        if job_id and (embedded_so_far % 20 == 0 or embedded_so_far == expected_embeddings):
+                            self._update_job_progress_conn(
+                                conn,
+                                job_id,
+                                "生成 embeddings（章节/段落/切片）…",
+                                embedded_so_far,
+                                expected_embeddings,
+                            )
+                        elif progress_cb and (embedded_so_far % 20 == 0 or embedded_so_far == expected_embeddings):
+                            progress_cb("生成 embeddings（章节/段落/切片）…", embedded_so_far, expected_embeddings)
 
             row = conn.execute(
                 """
@@ -146,12 +228,84 @@ class DocumentIndexer:
             source.unlink()
         return True
 
-    def reindex_project(self, project_id: int) -> ReindexResult:
+    def reindex_project(
+        self,
+        project_id: int,
+        *,
+        job_id: int | None = None,
+        progress_cb: ProgressCallback | None = None,
+        should_cancel: CancelChecker | None = None,
+    ) -> ReindexResult:
         with get_db() as conn:
+            if job_id:
+                self._update_job_progress_conn(conn, job_id, "统计待重建 embeddings 数量…", None, None)
+            elif progress_cb:
+                progress_cb("统计待重建 embeddings 数量…", None, None)
+            section_total = self._project_count(conn, "sections", project_id)
+            paragraph_total = self._project_count(conn, "paragraphs", project_id)
+            chunk_total = self._project_count(conn, "chunks", project_id)
+            embedding_total = section_total + paragraph_total + chunk_total
+            embedded_so_far = 0
+
+            if job_id:
+                self._update_job_progress_conn(conn, job_id, "清理旧 embeddings…", 0, embedding_total)
+            elif progress_cb:
+                progress_cb("清理旧 embeddings…", 0, embedding_total)
             self._delete_project_embeddings(conn, project_id)
-            section_count = self._reindex_sections(conn, project_id)
-            paragraph_count = self._reindex_paragraphs(conn, project_id)
-            chunk_count = self._reindex_chunks(conn, project_id)
+
+            if should_cancel and should_cancel():
+                raise CancelledError("cancel_requested")
+
+            if job_id:
+                self._update_job_progress_conn(conn, job_id, "重建章节 embeddings…", embedded_so_far, embedding_total)
+            elif progress_cb:
+                progress_cb("重建章节 embeddings…", embedded_so_far, embedding_total)
+            section_count = self._reindex_sections(
+                conn,
+                project_id,
+                progress_cb=progress_cb,
+                should_cancel=should_cancel,
+                offset=embedded_so_far,
+                total=embedding_total,
+                job_id=job_id,
+            )
+            embedded_so_far += section_count
+
+            if should_cancel and should_cancel():
+                raise CancelledError("cancel_requested")
+
+            if job_id:
+                self._update_job_progress_conn(conn, job_id, "重建段落 embeddings…", embedded_so_far, embedding_total)
+            elif progress_cb:
+                progress_cb("重建段落 embeddings…", embedded_so_far, embedding_total)
+            paragraph_count = self._reindex_paragraphs(
+                conn,
+                project_id,
+                progress_cb=progress_cb,
+                should_cancel=should_cancel,
+                offset=embedded_so_far,
+                total=embedding_total,
+                job_id=job_id,
+            )
+            embedded_so_far += paragraph_count
+
+            if should_cancel and should_cancel():
+                raise CancelledError("cancel_requested")
+
+            if job_id:
+                self._update_job_progress_conn(conn, job_id, "重建切片 embeddings…", embedded_so_far, embedding_total)
+            elif progress_cb:
+                progress_cb("重建切片 embeddings…", embedded_so_far, embedding_total)
+            chunk_count = self._reindex_chunks(
+                conn,
+                project_id,
+                progress_cb=progress_cb,
+                should_cancel=should_cancel,
+                offset=embedded_so_far,
+                total=embedding_total,
+                job_id=job_id,
+            )
+            embedded_so_far += chunk_count
 
         return ReindexResult(
             project_id=project_id,
@@ -187,7 +341,17 @@ class DocumentIndexer:
             (entity_type, entity_id, text, self.embedding.dumps(vector)),
         )
 
-    def _reindex_sections(self, conn, project_id: int) -> int:
+    def _reindex_sections(
+        self,
+        conn,
+        project_id: int,
+        *,
+        job_id: int | None = None,
+        progress_cb: ProgressCallback | None = None,
+        should_cancel: CancelChecker | None = None,
+        offset: int = 0,
+        total: int | None = None,
+    ) -> int:
         rows = conn.execute(
             """
             SELECT s.id, s.title, s.summary
@@ -198,16 +362,33 @@ class DocumentIndexer:
             """,
             (project_id,),
         ).fetchall()
-        for row in rows:
+        for index, row in enumerate(rows):
+            if should_cancel and (index % 50 == 0) and should_cancel():
+                raise CancelledError("cancel_requested")
             self._insert_embedding(
                 conn,
                 "section",
                 row["id"],
                 f"{row['title']}\n{row['summary']}",
             )
+            if total is not None and ((index + 1) % 50 == 0 or (index + 1) == len(rows)):
+                if job_id:
+                    self._update_job_progress_conn(conn, job_id, "重建章节 embeddings…", offset + index + 1, total)
+                elif progress_cb:
+                    progress_cb("重建章节 embeddings…", offset + index + 1, total)
         return len(rows)
 
-    def _reindex_paragraphs(self, conn, project_id: int) -> int:
+    def _reindex_paragraphs(
+        self,
+        conn,
+        project_id: int,
+        *,
+        job_id: int | None = None,
+        progress_cb: ProgressCallback | None = None,
+        should_cancel: CancelChecker | None = None,
+        offset: int = 0,
+        total: int | None = None,
+    ) -> int:
         rows = conn.execute(
             """
             SELECT p.id, p.summary, s.title AS section_title
@@ -219,16 +400,33 @@ class DocumentIndexer:
             """,
             (project_id,),
         ).fetchall()
-        for row in rows:
+        for index, row in enumerate(rows):
+            if should_cancel and (index % 50 == 0) and should_cancel():
+                raise CancelledError("cancel_requested")
             self._insert_embedding(
                 conn,
                 "paragraph",
                 row["id"],
                 f"{row['section_title'] or ''}\n{row['summary']}",
             )
+            if total is not None and ((index + 1) % 50 == 0 or (index + 1) == len(rows)):
+                if job_id:
+                    self._update_job_progress_conn(conn, job_id, "重建段落 embeddings…", offset + index + 1, total)
+                elif progress_cb:
+                    progress_cb("重建段落 embeddings…", offset + index + 1, total)
         return len(rows)
 
-    def _reindex_chunks(self, conn, project_id: int) -> int:
+    def _reindex_chunks(
+        self,
+        conn,
+        project_id: int,
+        *,
+        job_id: int | None = None,
+        progress_cb: ProgressCallback | None = None,
+        should_cancel: CancelChecker | None = None,
+        offset: int = 0,
+        total: int | None = None,
+    ) -> int:
         rows = conn.execute(
             """
             SELECT c.id, c.text, s.title AS section_title
@@ -240,14 +438,48 @@ class DocumentIndexer:
             """,
             (project_id,),
         ).fetchall()
-        for row in rows:
+        for index, row in enumerate(rows):
+            if should_cancel and (index % 100 == 0) and should_cancel():
+                raise CancelledError("cancel_requested")
             self._insert_embedding(
                 conn,
                 "chunk",
                 row["id"],
                 f"{row['section_title'] or ''}\n{row['text']}",
             )
+            if total is not None and ((index + 1) % 100 == 0 or (index + 1) == len(rows)):
+                if job_id:
+                    self._update_job_progress_conn(conn, job_id, "重建切片 embeddings…", offset + index + 1, total)
+                elif progress_cb:
+                    progress_cb("重建切片 embeddings…", offset + index + 1, total)
         return len(rows)
+
+    @staticmethod
+    def _update_job_progress(job_id: int, message: str, current: int | None, total: int | None) -> None:
+        with get_db() as conn:
+            DocumentIndexer._update_job_progress_conn(conn, job_id, message, current, total)
+
+    @staticmethod
+    def _update_job_progress_conn(
+        conn,
+        job_id: int,
+        message: str,
+        current: int | None,
+        total: int | None,
+    ) -> None:
+        sets: list[str] = ["updated_at = CURRENT_TIMESTAMP", "message = ?"]
+        values: list[object] = [message]
+        if current is not None:
+            sets.append("progress_current = ?")
+            values.append(current)
+        if total is not None:
+            sets.append("progress_total = ?")
+            values.append(total)
+        conn.execute(
+            f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?",
+            (*values, job_id),
+        )
+        conn.commit()
 
     @staticmethod
     def _delete_project_embeddings(conn, project_id: int) -> None:

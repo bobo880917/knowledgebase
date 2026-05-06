@@ -3,6 +3,37 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class CreateJobResponse(BaseModel):
+    job_id: int
+
+
+class JobOut(BaseModel):
+    id: int
+    project_id: int
+    type: str
+    status: str
+    progress_current: int | None = None
+    progress_total: int | None = None
+    message: str
+    result_json: str
+    error: str
+    retry_count: int
+    cancel_requested: int
+    created_at: str
+    updated_at: str
+
+
+class JobListResponse(BaseModel):
+    items: list[JobOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class ReindexJobCreate(BaseModel):
+    project_id: int = Field(default=1, ge=1)
+
+
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=300)

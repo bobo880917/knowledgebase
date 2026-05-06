@@ -2,6 +2,8 @@
 
 一个本地知识库 MVP：支持上传文档（`md/txt/docx/pdf`），本地解析与索引检索，并可接入 **OpenAI-compatible** LLM 服务做 RAG 问答。
 
+后续优化清单见 [`ROADMAP.md`](ROADMAP.md)。
+
 ## 功能特性
 
 - **文档管理**：上传/列表/删除（按项目维度组织）

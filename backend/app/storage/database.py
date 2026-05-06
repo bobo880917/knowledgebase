@@ -14,6 +14,24 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    progress_current INTEGER,
+    progress_total INTEGER,
+    message TEXT NOT NULL DEFAULT '',
+    params_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL DEFAULT 1,
@@ -75,6 +93,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
 INDEXES = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_project_hash ON documents(project_id, content_hash);
 CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_project_created_at ON jobs(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_sections_document ON sections(document_id);
 CREATE INDEX IF NOT EXISTS idx_paragraphs_document ON paragraphs(document_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
@@ -87,6 +107,8 @@ def connect() -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 

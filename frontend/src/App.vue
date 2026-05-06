@@ -1,20 +1,25 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
+  cancelJob,
   createProject,
+  createImportJob,
+  createReindexJob,
   deleteDocument,
   deleteProject,
   getEmbeddingHealth,
+  getJob,
   getProjectIndexStats,
   getProviderHealth,
+  listJobs,
   listDocuments,
   listProjects,
-  reindexProject,
   searchKnowledge,
+  retryJob,
   updateProject,
-  uploadDocument,
   type DocumentItem,
   type EmbeddingHealth,
+  type JobItem,
   type ProjectIndexStats,
   type ProjectItem,
   type ProviderHealth,
@@ -23,12 +28,21 @@ import {
   type UploadResult,
 } from './services/api';
 
-type ViewKey = 'projects' | 'documents' | 'search';
+type ViewKey = 'projects' | 'documents' | 'search' | 'jobs';
 
 const projects = ref<ProjectItem[]>([]);
 const activeProjectId = ref(1);
 const currentView = ref<ViewKey>('search');
 const documents = ref<DocumentItem[]>([]);
+const jobs = ref<JobItem[]>([]);
+const jobsPageSize = 10;
+const jobsPage = ref(1);
+const jobsTotal = ref(0);
+const jobsBusy = ref(false);
+const jobsError = ref('');
+const lastCreatedJobId = ref<number | null>(null);
+const selectedJobId = ref<number | null>(null);
+let selectedJobTimer: number | null = null;
 const provider = ref<ProviderHealth | null>(null);
 const embedding = ref<EmbeddingHealth | null>(null);
 const indexStats = ref<ProjectIndexStats | null>(null);
@@ -55,6 +69,7 @@ const error = ref('');
 const menuItems: Array<{ key: ViewKey; label: string; description: string }> = [
   { key: 'search', label: '检索问答', description: '搜索、RAG 与来源调试' },
   { key: 'documents', label: '文档管理', description: '上传、查看和删除文档' },
+  { key: 'jobs', label: '任务中心', description: '导入/重建的进度与历史' },
   { key: 'projects', label: '项目空间', description: '创建、编辑和切换项目' },
 ];
 
@@ -74,6 +89,13 @@ const stats = computed(() => ({
   mode: mode.value === 'rag' ? 'RAG 问答' : '纯检索',
 }));
 
+const jobsTotalPages = computed(() => Math.max(1, Math.ceil(jobsTotal.value / jobsPageSize)));
+
+const selectedJob = computed(() => {
+  if (selectedJobId.value == null) return jobs.value[0] ?? null;
+  return jobs.value.find((job) => job.id === selectedJobId.value) ?? jobs.value[0] ?? null;
+});
+
 function onFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
   selectedFile.value = input.files?.[0] ?? null;
@@ -81,6 +103,11 @@ function onFileChange(event: Event) {
 
 function goTo(view: ViewKey) {
   currentView.value = view;
+}
+
+async function onProjectSelect(event: Event) {
+  const select = event.target as HTMLSelectElement;
+  await switchProject(Number(select.value));
 }
 
 async function refresh() {
@@ -94,13 +121,39 @@ async function refresh() {
   embedding.value = await getEmbeddingHealth();
 }
 
+async function refreshJobs() {
+  jobsBusy.value = true;
+  jobsError.value = '';
+  try {
+    const offset = (jobsPage.value - 1) * jobsPageSize;
+    const response = await listJobs(activeProjectId.value, jobsPageSize, offset);
+    jobs.value = response.items;
+    jobsTotal.value = response.total;
+    if (jobs.value.length && !jobs.value.some((job) => job.id === selectedJobId.value)) {
+      selectedJobId.value = jobs.value[0].id;
+    }
+    if (!jobs.value.length) {
+      selectedJobId.value = null;
+    }
+  } catch (err) {
+    jobsError.value = err instanceof Error ? err.message : '读取任务失败';
+  } finally {
+    jobsBusy.value = false;
+  }
+}
+
 async function switchProject(projectId: number) {
   activeProjectId.value = projectId;
   uploadResult.value = null;
   result.value = null;
   editingProject.value = false;
+  jobsPage.value = 1;
+  selectedJobId.value = null;
   documents.value = await listDocuments(projectId);
   indexStats.value = await getProjectIndexStats(projectId);
+  if (currentView.value === 'jobs') {
+    await refreshJobs();
+  }
 }
 
 async function submitProject() {
@@ -116,7 +169,7 @@ async function submitProject() {
     newProjectDescription.value = '';
     await refresh();
     await switchProject(project.id);
-    currentView.value = 'documents';
+    currentView.value = 'projects';
   } catch (err) {
     error.value = err instanceof Error ? err.message : '创建项目失败';
   } finally {
@@ -124,10 +177,11 @@ async function submitProject() {
   }
 }
 
-function startEditProject() {
-  if (!activeProject.value) return;
-  editProjectName.value = activeProject.value.name;
-  editProjectDescription.value = activeProject.value.description;
+function startEditProject(project = activeProject.value) {
+  if (!project) return;
+  activeProjectId.value = project.id;
+  editProjectName.value = project.name;
+  editProjectDescription.value = project.description;
   editingProject.value = true;
 }
 
@@ -151,18 +205,21 @@ async function submitProjectEdit() {
   }
 }
 
-async function removeProject() {
-  if (!activeProject.value || activeProject.value.id === 1) return;
-  const confirmed = window.confirm(`确认删除项目“${activeProject.value.name}”及其全部文档和索引吗？`);
+async function removeProject(project = activeProject.value) {
+  if (!project || project.id === 1) return;
+  const confirmed = window.confirm(`确认删除项目“${project.name}”及其全部文档和索引吗？`);
   if (!confirmed) return;
 
   deletingProject.value = true;
   error.value = '';
   try {
-    await deleteProject(activeProject.value.id);
-    activeProjectId.value = 1;
+    await deleteProject(project.id);
+    if (activeProjectId.value === project.id) {
+      activeProjectId.value = 1;
+    }
     uploadResult.value = null;
     result.value = null;
+    editingProject.value = false;
     await refresh();
   } catch (err) {
     error.value = err instanceof Error ? err.message : '删除项目失败';
@@ -176,12 +233,15 @@ async function rebuildCurrentProjectIndex() {
   reindexing.value = true;
   error.value = '';
   try {
-    reindexResult.value = await reindexProject(activeProject.value.id);
+    const res = await createReindexJob(activeProject.value.id);
+    lastCreatedJobId.value = res.job_id;
+    reindexResult.value = null;
     result.value = null;
-    indexStats.value = await getProjectIndexStats(activeProject.value.id);
-    embedding.value = await getEmbeddingHealth();
+    currentView.value = 'jobs';
+    jobsPage.value = 1;
+    await refreshJobs();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : '重建索引失败';
+    error.value = err instanceof Error ? err.message : '创建重建索引任务失败';
   } finally {
     reindexing.value = false;
   }
@@ -192,13 +252,128 @@ async function submitUpload() {
   uploading.value = true;
   error.value = '';
   try {
-    uploadResult.value = await uploadDocument(selectedFile.value, activeProjectId.value);
+    const res = await createImportJob(selectedFile.value, activeProjectId.value);
+    lastCreatedJobId.value = res.job_id;
     selectedFile.value = null;
-    await refresh();
+    uploadResult.value = null;
+    currentView.value = 'jobs';
+    jobsPage.value = 1;
+    await refreshJobs();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : '上传失败';
+    error.value = err instanceof Error ? err.message : '创建导入任务失败';
   } finally {
     uploading.value = false;
+  }
+}
+
+function jobBadge(job: JobItem) {
+  if (job.status === 'queued') return '排队中';
+  if (job.status === 'running') return '执行中';
+  if (job.status === 'succeeded') return '已完成';
+  if (job.status === 'failed') return '失败';
+  if (job.status === 'cancelled') return '已取消';
+  return job.status;
+}
+
+async function cancel(job: JobItem) {
+  if (job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled') return;
+  try {
+    await cancelJob(job.id);
+    await refreshJobs();
+  } catch (err) {
+    jobsError.value = err instanceof Error ? err.message : '取消失败';
+  }
+}
+
+async function retry(job: JobItem) {
+  if (job.status !== 'failed') return;
+  try {
+    const res = await retryJob(job.id);
+    lastCreatedJobId.value = res.job_id;
+    await refreshJobs();
+  } catch (err) {
+    jobsError.value = err instanceof Error ? err.message : '重试失败';
+  }
+}
+
+function formatProgress(job: JobItem) {
+  if (job.progress_current == null || job.progress_total == null) return '';
+  return `${job.progress_current}/${job.progress_total}`;
+}
+
+function progressPercent(job: JobItem) {
+  if (!job.progress_total || job.progress_current == null) return 0;
+  return Math.min(100, Math.round((job.progress_current / job.progress_total) * 100));
+}
+
+function jobTypeLabel(job: JobItem) {
+  if (job.type === 'import_document') return '文档导入';
+  if (job.type === 'reindex_project') return '重建索引';
+  return job.type;
+}
+
+function statusClass(job: JobItem) {
+  return `status-${job.status}`;
+}
+
+function selectJob(job: JobItem) {
+  selectedJobId.value = job.id;
+}
+
+function upsertJob(job: JobItem) {
+  const index = jobs.value.findIndex((item) => item.id === job.id);
+  if (index >= 0) {
+    jobs.value.splice(index, 1, job);
+  }
+}
+
+async function refreshSelectedJob() {
+  if (selectedJobId.value == null) return;
+  try {
+    const job = await getJob(selectedJobId.value);
+    upsertJob(job);
+  } catch (err) {
+    jobsError.value = err instanceof Error ? err.message : '刷新任务进度失败';
+  }
+}
+
+function stopSelectedJobAutoRefresh() {
+  if (selectedJobTimer != null) {
+    window.clearInterval(selectedJobTimer);
+    selectedJobTimer = null;
+  }
+}
+
+function syncSelectedJobAutoRefresh() {
+  const job = selectedJob.value;
+  const shouldAutoRefresh =
+    currentView.value === 'jobs' && job && (job.status === 'queued' || job.status === 'running');
+
+  if (!shouldAutoRefresh) {
+    stopSelectedJobAutoRefresh();
+    return;
+  }
+
+  if (selectedJobTimer != null) return;
+  selectedJobTimer = window.setInterval(() => {
+    refreshSelectedJob().catch(() => undefined);
+  }, 1500);
+}
+
+async function goJobsPage(nextPage: number) {
+  const page = Math.min(Math.max(nextPage, 1), jobsTotalPages.value);
+  if (page === jobsPage.value) return;
+  jobsPage.value = page;
+  selectedJobId.value = null;
+  await refreshJobs();
+}
+
+function tryParseResult(job: JobItem): any | null {
+  if (!job.result_json) return null;
+  try {
+    return JSON.parse(job.result_json);
+  } catch {
+    return null;
   }
 }
 
@@ -239,6 +414,40 @@ onMounted(() => {
     error.value = err instanceof Error ? err.message : '初始化失败';
   });
 });
+
+watch(
+  () => currentView.value,
+  (view) => {
+    if (view === 'jobs') {
+      refreshJobs().catch(() => undefined);
+    } else {
+      stopSelectedJobAutoRefresh();
+    }
+  },
+);
+
+watch(
+  () => jobs.value,
+  (newJobs, oldJobs) => {
+    const hadBusy = (oldJobs ?? []).some((j) => j.status === 'queued' || j.status === 'running');
+    const hasBusy = (newJobs ?? []).some((j) => j.status === 'queued' || j.status === 'running');
+    if (hadBusy && !hasBusy) {
+      refresh().catch(() => undefined);
+    }
+  },
+  { deep: true },
+);
+
+watch(
+  () => [currentView.value, selectedJob.value?.id, selectedJob.value?.status],
+  () => {
+    syncSelectedJobAutoRefresh();
+  },
+);
+
+onBeforeUnmount(() => {
+  stopSelectedJobAutoRefresh();
+});
 </script>
 
 <template>
@@ -272,10 +481,18 @@ onMounted(() => {
 
     <section class="app-main">
       <header class="topbar panel">
-        <div>
+        <div class="topbar-title">
           <p class="eyebrow">{{ activeViewTitle }}</p>
           <h2>{{ stats.project }}</h2>
         </div>
+        <label class="project-switcher">
+          <span>当前项目</span>
+          <select :value="activeProjectId" @change="onProjectSelect">
+            <option v-for="project in projects" :key="project.id" :value="project.id">
+              {{ project.name }}
+            </option>
+          </select>
+        </label>
         <div class="stats-strip">
           <span>文档 {{ stats.documents }}</span>
           <span>模型 {{ stats.provider }}</span>
@@ -287,47 +504,69 @@ onMounted(() => {
       <p v-if="error" class="error">{{ error }}</p>
 
       <section v-if="currentView === 'projects'" class="page-grid projects-page">
-        <article class="panel page-card">
+        <article class="panel page-card project-directory-card">
           <div class="section-heading">
             <div>
               <h2>项目列表</h2>
-              <p class="muted">切换项目后，文档列表、检索和 RAG 上下文都会同步切换。</p>
+              <p class="muted">项目是知识库的隔离边界。点击“设为当前”后，检索问答、文档和任务都会切换到该项目。</p>
             </div>
           </div>
 
-          <div class="project-list spacious">
-            <button
+          <div class="project-table">
+            <article
               v-for="project in projects"
               :key="project.id"
+              class="project-row"
               :class="{ active: project.id === activeProjectId }"
-              @click="switchProject(project.id)"
             >
-              {{ project.name }}
-            </button>
+              <div>
+                <strong>{{ project.name }}</strong>
+                <p>{{ project.description || '暂无简介' }}</p>
+              </div>
+              <div class="project-row-actions">
+                <button class="ghost-button small-button" :disabled="project.id === activeProjectId" @click="switchProject(project.id)">
+                  {{ project.id === activeProjectId ? '当前项目' : '设为当前' }}
+                </button>
+                <button class="ghost-button small-button" @click="startEditProject(project)">编辑</button>
+                <button
+                  class="danger-button small-button"
+                  :disabled="project.id === 1 || deletingProject"
+                  :title="project.id === 1 ? '默认项目不可删除' : ''"
+                  @click="removeProject(project)"
+                >
+                  删除
+                </button>
+              </div>
+            </article>
           </div>
         </article>
 
-        <article class="panel page-card">
+        <article class="panel page-card project-editor-card">
           <div class="section-heading">
             <div>
               <h2>当前项目</h2>
-              <p class="muted">默认项目不可删除，其他项目删除时会同步删除全部文档和索引。</p>
+              <p class="muted">这里展示全局当前项目。你也可以在页面顶部随时切换项目。</p>
             </div>
           </div>
 
-          <div v-if="activeProject" class="project-actions large-card">
+          <div v-if="activeProject" class="project-profile">
             <div>
               <strong>{{ activeProject.name }}</strong>
               <p>{{ activeProject.description || '暂无简介' }}</p>
             </div>
+            <div class="project-profile-meta">
+              <span>文档 {{ indexStats?.document_count ?? documents.length }}</span>
+              <span>章节 {{ indexStats?.section_count ?? '-' }}</span>
+              <span>Embeddings {{ indexStats?.embedding_count ?? '-' }}</span>
+            </div>
             <div class="action-row">
-              <button type="button" class="ghost-button" @click="startEditProject">编辑</button>
+              <button type="button" class="ghost-button" @click="startEditProject()">编辑当前项目</button>
               <button
                 type="button"
                 class="danger-button"
                 :disabled="activeProject.id === 1 || deletingProject"
                 :title="activeProject.id === 1 ? '默认项目不可删除' : ''"
-                @click="removeProject"
+                @click="removeProject()"
               >
                 {{ deletingProject ? '删除中...' : '删除项目' }}
               </button>
@@ -346,10 +585,27 @@ onMounted(() => {
           </form>
         </article>
 
-        <article class="panel page-card">
+        <article class="panel page-card create-project-card">
           <div class="section-heading">
             <div>
-              <h2>Embedding 索引</h2>
+              <h2>新增项目</h2>
+              <p class="muted">例如：财务、法律、产品资料、学习笔记。创建后会自动设为当前项目。</p>
+            </div>
+          </div>
+
+          <form class="project-form clean" @submit.prevent="submitProject">
+            <input v-model="newProjectName" placeholder="新项目名，如：财务" />
+            <input v-model="newProjectDescription" placeholder="简介，可选" />
+            <button :disabled="creatingProject || !newProjectName.trim()">
+              {{ creatingProject ? '创建中...' : '创建项目' }}
+            </button>
+          </form>
+        </article>
+
+        <article class="panel page-card project-index-card">
+          <div class="section-heading">
+            <div>
+              <h2>当前项目索引</h2>
               <p class="muted">
                 当前 provider：{{ embedding?.provider || '-' }}；
                 模型：{{ embedding?.model || '-' }}；
@@ -386,23 +642,6 @@ onMounted(() => {
               {{ reindexResult.chunk_count }} 个切片
             </span>
           </div>
-        </article>
-
-        <article class="panel page-card create-project-card">
-          <div class="section-heading">
-            <div>
-              <h2>创建项目</h2>
-              <p class="muted">例如：财务、法律、产品资料、学习笔记。</p>
-            </div>
-          </div>
-
-          <form class="project-form clean" @submit.prevent="submitProject">
-            <input v-model="newProjectName" placeholder="新项目名，如：财务" />
-            <input v-model="newProjectDescription" placeholder="简介，可选" />
-            <button :disabled="creatingProject || !newProjectName.trim()">
-              {{ creatingProject ? '创建中...' : '创建项目' }}
-            </button>
-          </form>
         </article>
       </section>
 
@@ -457,6 +696,110 @@ onMounted(() => {
               <p>{{ doc.summary || '暂无简介' }}</p>
             </article>
             <p v-if="!documents.length" class="empty-state">当前项目还没有文档，先上传一份资料建立索引。</p>
+          </div>
+        </article>
+      </section>
+
+      <section v-else-if="currentView === 'jobs'" class="page-grid jobs-page">
+        <article class="panel page-card">
+          <div class="section-heading">
+            <div>
+              <h2>任务中心</h2>
+              <p class="muted">当前项目：{{ activeProject?.name }}。列表手动刷新；选中的执行中任务会自动更新进度。</p>
+            </div>
+            <button class="ghost-button compact-button" :disabled="jobsBusy" @click="refreshJobs">
+              {{ jobsBusy ? '刷新中...' : '刷新任务' }}
+            </button>
+          </div>
+
+          <p v-if="jobsError" class="error">{{ jobsError }}</p>
+
+          <div class="jobs-board">
+            <section class="jobs-list-card">
+              <div class="jobs-list-head">
+                <span>共 {{ jobsTotal }} 个任务</span>
+                <span>第 {{ jobsPage }} / {{ jobsTotalPages }} 页</span>
+              </div>
+
+              <button
+                v-for="job in jobs"
+                :key="job.id"
+                type="button"
+                class="job-row"
+                :class="{
+                  active: selectedJob?.id === job.id,
+                  highlight: lastCreatedJobId === job.id,
+                }"
+                @click="selectJob(job)"
+              >
+                <span class="job-row-main">
+                  <strong>#{{ job.id }} · {{ jobTypeLabel(job) }}</strong>
+                  <small>{{ job.message || '暂无进度信息' }}</small>
+                </span>
+                <span class="job-row-side">
+                  <b class="status-pill" :class="statusClass(job)">{{ jobBadge(job) }}</b>
+                  <small>{{ formatProgress(job) || '-' }}</small>
+                </span>
+              </button>
+
+              <p v-if="!jobs.length" class="empty-state">当前项目还没有任务记录。去“文档管理”上传或去“项目空间”触发重建索引。</p>
+
+              <div v-if="jobsTotal > jobsPageSize" class="pagination-bar">
+                <button class="ghost-button small-button" :disabled="jobsPage <= 1" @click="goJobsPage(jobsPage - 1)">
+                  上一页
+                </button>
+                <span class="muted">{{ (jobsPage - 1) * jobsPageSize + 1 }} - {{ Math.min(jobsPage * jobsPageSize, jobsTotal) }} / {{ jobsTotal }}</span>
+                <button class="ghost-button small-button" :disabled="jobsPage >= jobsTotalPages" @click="goJobsPage(jobsPage + 1)">
+                  下一页
+                </button>
+              </div>
+            </section>
+
+            <aside v-if="selectedJob" class="job-detail-card">
+              <div class="document-head">
+                <div>
+                  <span class="muted">任务详情</span>
+                  <h3>#{{ selectedJob.id }} · {{ jobTypeLabel(selectedJob) }}</h3>
+                </div>
+                <b class="status-pill" :class="statusClass(selectedJob)">{{ jobBadge(selectedJob) }}</b>
+              </div>
+
+              <p class="muted">{{ selectedJob.message || '暂无进度信息' }}</p>
+              <div class="progress-track">
+                <span :style="{ width: `${progressPercent(selectedJob)}%` }"></span>
+              </div>
+              <div class="score-grid">
+                <span>进度</span><strong>{{ formatProgress(selectedJob) || '-' }}</strong>
+                <span>创建时间</span><strong>{{ selectedJob.created_at }}</strong>
+                <span>更新时间</span><strong>{{ selectedJob.updated_at }}</strong>
+                <span>重试次数</span><strong>{{ selectedJob.retry_count }}</strong>
+              </div>
+
+              <details v-if="selectedJob.error || selectedJob.result_json" class="debug-panel">
+                <summary>查看结果 / 错误</summary>
+                <pre v-if="selectedJob.error" class="error result-block">{{ selectedJob.error }}</pre>
+                <pre v-else class="muted result-block">{{
+                  tryParseResult(selectedJob) ? JSON.stringify(tryParseResult(selectedJob), null, 2) : selectedJob.result_json
+                }}</pre>
+              </details>
+
+              <div class="action-row">
+                <button
+                  class="ghost-button"
+                  :disabled="selectedJob.status !== 'queued' && selectedJob.status !== 'running'"
+                  @click="cancel(selectedJob)"
+                >
+                  取消
+                </button>
+                <button
+                  class="ghost-button"
+                  :disabled="selectedJob.status !== 'failed'"
+                  @click="retry(selectedJob)"
+                >
+                  重试
+                </button>
+              </div>
+            </aside>
           </div>
         </article>
       </section>

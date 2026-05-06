@@ -3,12 +3,16 @@ import sqlite3
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
 from app.schemas import (
+    CreateJobResponse,
     EmbeddingHealth,
     ProjectCreate,
     ProjectIndexStats,
     ProjectOut,
     ProjectUpdate,
     ProviderHealth,
+    JobListResponse,
+    JobOut,
+    ReindexJobCreate,
     SearchRequest,
     SearchResponse,
     SourceSummary,
@@ -17,6 +21,7 @@ from app.schemas import (
 )
 from app.services.embeddings import EmbeddingService
 from app.services.indexer import DocumentIndexer
+from app.services.jobs import job_service
 from app.services.llm_provider import LLMProvider
 from app.services.projects import ProjectService
 from app.services.retrieval import RetrievalService
@@ -92,6 +97,66 @@ def reindex_project(project_id: int) -> ReindexResult:
 def project_index_stats(project_id: int) -> ProjectIndexStats:
     _ensure_project(project_id)
     return indexer.get_project_index_stats(project_id)
+
+
+@router.post("/jobs/import", response_model=CreateJobResponse)
+async def create_import_job(
+    file: UploadFile = File(...),
+    project_id: int = Form(default=1, ge=1),
+) -> CreateJobResponse:
+    _ensure_project(project_id)
+    res = await job_service.create_import_job(project_id, file)
+    return CreateJobResponse(job_id=res.job_id)
+
+
+@router.post("/jobs/reindex", response_model=CreateJobResponse)
+def create_reindex_job(req: ReindexJobCreate) -> CreateJobResponse:
+    _ensure_project(req.project_id)
+    res = job_service.create_reindex_job(req.project_id)
+    return CreateJobResponse(job_id=res.job_id)
+
+
+@router.get("/jobs", response_model=JobListResponse)
+def list_jobs(
+    project_id: int = Query(default=1, ge=1),
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> JobListResponse:
+    _ensure_project(project_id)
+    rows, total = job_service.list_jobs(project_id, limit, offset)
+    return JobListResponse(
+        items=[JobOut(**dict(r)) for r in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/jobs/{job_id}", response_model=JobOut)
+def get_job(job_id: int) -> JobOut:
+    row = job_service.get_job(job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return JobOut(**dict(row))
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: int) -> dict[str, bool]:
+    res = job_service.request_cancel(job_id)
+    if res is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"cancelled": bool(res)}
+
+
+@router.post("/jobs/{job_id}/retry", response_model=CreateJobResponse)
+def retry_job(job_id: int) -> CreateJobResponse:
+    try:
+        new_job_id = job_service.retry_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if new_job_id is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return CreateJobResponse(job_id=new_job_id)
 
 
 @router.get("/documents")

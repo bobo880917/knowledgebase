@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import router
 from app.core.config import get_settings
 from app.storage.database import init_db
+from app.services.jobs import job_service
 
 settings = get_settings()
 
@@ -21,6 +22,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    job_service.resume_pending_jobs()
 
 
 app.include_router(router)
