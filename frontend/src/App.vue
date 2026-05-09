@@ -658,13 +658,27 @@ onBeforeUnmount(() => {
 
           <div v-if="indexStats" class="index-stats-card" :class="{ warning: !indexStats.indexed }">
             <strong>{{ indexStats.indexed ? '当前项目索引完整' : '当前项目索引需要重建' }}</strong>
+            <p class="muted" style="margin: 0">
+              当前配置版本：{{ indexStats.embedding_version || '-' }}
+              <template v-if="indexStats.dominant_embedding_version">
+                · 库内主版本：{{ indexStats.dominant_embedding_version }}
+              </template>
+              <template v-if="indexStats.matches_current_config"> · 版本匹配</template>
+              <template v-else> · 版本不匹配</template>
+            </p>
             <div class="index-stats-grid">
               <span>文档</span><b>{{ indexStats.document_count }}</b>
               <span>章节</span><b>{{ indexStats.section_count }}</b>
               <span>段落</span><b>{{ indexStats.paragraph_count }}</b>
               <span>切片</span><b>{{ indexStats.chunk_count }}</b>
-              <span>Embeddings</span><b>{{ indexStats.embedding_count }}</b>
+              <span>Embeddings(当前版本)</span><b>{{ indexStats.embedding_count }}</b>
             </div>
+            <p class="muted" style="margin: 0">
+              Embeddings(总计)：{{ indexStats.embedding_count_total }}
+              · provider：{{ indexStats.embedding_provider || '-' }}
+              · model：{{ indexStats.embedding_model || '-' }}
+              · dim：{{ indexStats.embedding_dimension || '-' }}
+            </p>
           </div>
 
           <button :disabled="reindexing || !activeProject" @click="rebuildCurrentProjectIndex">

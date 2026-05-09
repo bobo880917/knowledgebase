@@ -45,6 +45,13 @@ export type ProjectIndexStats = {
   paragraph_count: number;
   chunk_count: number;
   embedding_count: number;
+  embedding_count_total: number;
+  embedding_provider: string;
+  embedding_model: string;
+  embedding_dimension: number;
+  embedding_version: string;
+  dominant_embedding_version: string;
+  matches_current_config: boolean;
   indexed: boolean;
 };
 

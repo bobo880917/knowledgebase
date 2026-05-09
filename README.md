@@ -29,16 +29,29 @@
 
 ### 1）启动后端（FastAPI）
 
+在 **`backend/`** 目录下执行（模块路径为 `app.main`）。
+
+**推荐（使用 [uv](https://docs.astral.sh/uv/)）：**
+
+```bash
+cd backend
+uv sync
+# 若要启用 sentence-transformers 语义 embedding：
+# uv sync --extra embedding
+
+cp .env.example .env
+uv run uvicorn app.main:app --reload --port 8000
+```
+
+**或使用 venv + pip：**
+
 ```bash
 cd backend
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-# 基础依赖
 pip install -e .
-
-# 如果要使用 sentence-transformers embedding（推荐语义检索）
-pip install -e ".[embedding]"
+# pip install -e ".[embedding]"
 
 cp .env.example .env
 uvicorn app.main:app --reload --port 8000

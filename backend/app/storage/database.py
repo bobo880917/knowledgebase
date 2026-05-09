@@ -85,6 +85,10 @@ CREATE TABLE IF NOT EXISTS embeddings (
     entity_id INTEGER NOT NULL,
     text TEXT NOT NULL,
     vector TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    dimension INTEGER NOT NULL DEFAULT 0,
+    version TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -99,6 +103,7 @@ CREATE INDEX IF NOT EXISTS idx_sections_document ON sections(document_id);
 CREATE INDEX IF NOT EXISTS idx_paragraphs_document ON paragraphs(document_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_entity ON embeddings(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_embeddings_version ON embeddings(version);
 """
 
 
@@ -136,6 +141,7 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO projects(id, name, description) VALUES (1, '默认项目', '历史文档和未分类文档')"
         )
         _migrate_existing_database(conn)
+        _migrate_embeddings_table(conn)
         _repair_legacy_document_foreign_keys(conn)
         conn.executescript(INDEXES)
         violations = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -153,6 +159,18 @@ def _migrate_existing_database(conn: sqlite3.Connection) -> None:
     has_global_hash_unique = _has_global_content_hash_unique(conn)
     if not has_project_id or has_global_hash_unique:
         _rebuild_documents_table(conn, has_project_id)
+
+
+def _migrate_embeddings_table(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(embeddings)").fetchall()}
+    if "provider" not in columns:
+        conn.execute("ALTER TABLE embeddings ADD COLUMN provider TEXT NOT NULL DEFAULT ''")
+    if "model" not in columns:
+        conn.execute("ALTER TABLE embeddings ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+    if "dimension" not in columns:
+        conn.execute("ALTER TABLE embeddings ADD COLUMN dimension INTEGER NOT NULL DEFAULT 0")
+    if "version" not in columns:
+        conn.execute("ALTER TABLE embeddings ADD COLUMN version TEXT NOT NULL DEFAULT ''")
 
 
 def _has_global_content_hash_unique(conn: sqlite3.Connection) -> bool:

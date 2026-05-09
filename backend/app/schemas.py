@@ -92,6 +92,13 @@ class ProjectIndexStats(BaseModel):
     paragraph_count: int
     chunk_count: int
     embedding_count: int
+    embedding_count_total: int = 0
+    embedding_provider: str = ""
+    embedding_model: str = ""
+    embedding_dimension: int = 0
+    embedding_version: str = ""
+    dominant_embedding_version: str = ""
+    matches_current_config: bool = False
     indexed: bool
 
 
