@@ -1,5 +1,6 @@
 import hashlib
 import time
+import uuid
 from pathlib import Path
 
 from fastapi import UploadFile
@@ -38,6 +39,7 @@ class DocumentIndexer:
         job_id: int | None = None,
         progress_cb: ProgressCallback | None = None,
         should_cancel: CancelChecker | None = None,
+        import_dedup_mode: str | None = None,
     ) -> UploadResult:
         original_name = file.filename or "untitled"
         suffix = Path(original_name).suffix.lower()
@@ -51,27 +53,42 @@ class DocumentIndexer:
             progress_cb("读取文件…", None, None)
         content = await file.read()
         raw_content_hash = hashlib.sha256(content).hexdigest()
-        content_hash = hashlib.sha256(f"{project_id}:{raw_content_hash}".encode("utf-8")).hexdigest()
-        target = self.settings.upload_dir / f"project-{project_id}-{content_hash}{suffix}"
-        if not target.exists():
-            target.write_bytes(content)
+        fingerprint = self._content_fingerprint(project_id, raw_content_hash)
+        mode_raw = (import_dedup_mode or self.settings.import_dedup_mode).strip().lower()
+        mode = (
+            mode_raw
+            if mode_raw in ("ignore", "overwrite", "keep")
+            else self.settings.import_dedup_mode
+        )
+        if mode == "keep":
+            content_hash = hashlib.sha256(
+                f"{project_id}:{raw_content_hash}:{uuid.uuid4().hex}".encode("utf-8")
+            ).hexdigest()
+        else:
+            content_hash = fingerprint
 
+        doc_ids_to_remove: list[int] = []
         with get_db() as conn:
-            existing = conn.execute(
-                """
-                SELECT id, project_id, filename, file_type, summary, created_at
-                FROM documents
-                WHERE project_id = ? AND content_hash = ?
-                """,
-                (project_id, content_hash),
-            ).fetchone()
-            if existing:
-                return UploadResult(
-                    document=DocumentOut(**dict(existing)),
-                    section_count=self._count(conn, "sections", existing["id"]),
-                    paragraph_count=self._count(conn, "paragraphs", existing["id"]),
-                    chunk_count=self._count(conn, "chunks", existing["id"]),
-                )
+            if mode == "ignore":
+                existing = self._fetch_duplicate_document_row(conn, project_id, fingerprint)
+                if existing:
+                    doc_id = int(existing["id"])
+                    return UploadResult(
+                        document=DocumentOut(**dict(existing)),
+                        section_count=self._count(conn, "sections", doc_id),
+                        paragraph_count=self._count(conn, "paragraphs", doc_id),
+                        chunk_count=self._count(conn, "chunks", doc_id),
+                        dedup_action="skipped_duplicate",
+                    )
+            elif mode == "overwrite":
+                doc_ids_to_remove = self._list_duplicate_document_ids(conn, project_id, fingerprint)
+
+        replaced_any = bool(doc_ids_to_remove)
+        for doc_id in doc_ids_to_remove:
+            self.delete_document(doc_id, project_id)
+
+        target = self.settings.upload_dir / f"project-{project_id}-{content_hash}{suffix}"
+        target.write_bytes(content)
 
         if job_id:
             self._update_job_progress(job_id, "解析文档结构…", None, None)
@@ -100,10 +117,18 @@ class DocumentIndexer:
         with get_db() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO documents(project_id, filename, file_type, source_path, content_hash, summary)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO documents(project_id, filename, file_type, source_path, content_hash, content_fingerprint, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (project_id, original_name, suffix.lstrip("."), str(target), content_hash, document_summary),
+                (
+                    project_id,
+                    original_name,
+                    suffix.lstrip("."),
+                    str(target),
+                    content_hash,
+                    fingerprint,
+                    document_summary,
+                ),
             )
             document_id = int(cursor.lastrowid)
             section_count = 0
@@ -200,7 +225,45 @@ class DocumentIndexer:
                 section_count=section_count,
                 paragraph_count=paragraph_count,
                 chunk_count=chunk_count,
+                dedup_action="replaced" if replaced_any else "imported",
             )
+
+    @staticmethod
+    def _content_fingerprint(project_id: int, raw_content_hash: str) -> str:
+        return hashlib.sha256(f"{project_id}:{raw_content_hash}".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _fetch_duplicate_document_row(conn, project_id: int, fingerprint: str):
+        return conn.execute(
+            """
+            SELECT id, project_id, filename, file_type, summary, created_at
+            FROM documents
+            WHERE project_id = ?
+              AND (
+                content_fingerprint = ?
+                OR (COALESCE(content_fingerprint, '') = '' AND content_hash = ?)
+              )
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT 1
+            """,
+            (project_id, fingerprint, fingerprint),
+        ).fetchone()
+
+    @staticmethod
+    def _list_duplicate_document_ids(conn, project_id: int, fingerprint: str) -> list[int]:
+        rows = conn.execute(
+            """
+            SELECT id FROM documents
+            WHERE project_id = ?
+              AND (
+                content_fingerprint = ?
+                OR (COALESCE(content_fingerprint, '') = '' AND content_hash = ?)
+              )
+            ORDER BY id ASC
+            """,
+            (project_id, fingerprint, fingerprint),
+        ).fetchall()
+        return [int(r["id"]) for r in rows]
 
     def list_documents(self, project_id: int) -> list[DocumentOut]:
         with get_db() as conn:

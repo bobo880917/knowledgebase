@@ -29,11 +29,25 @@ class JobService:
         self._executor = ThreadPoolExecutor(max_workers=2)
         self._start_lock = threading.Lock()
 
-    async def create_import_job(self, project_id: int, upload_file: UploadFile) -> CreateJobResult:
+    async def create_import_job(
+        self,
+        project_id: int,
+        upload_file: UploadFile,
+        *,
+        import_dedup_mode: str | None = None,
+    ) -> CreateJobResult:
+        job_params: dict[str, Any] = {"original_filename": upload_file.filename or "upload"}
+        if import_dedup_mode and import_dedup_mode.strip().lower() in (
+            "ignore",
+            "overwrite",
+            "keep",
+        ):
+            job_params["import_dedup_mode"] = import_dedup_mode.strip().lower()
+
         job_id = self._create_job_row(
             project_id=project_id,
             job_type="import_document",
-            params={"original_filename": upload_file.filename or "upload"},
+            params=job_params,
         )
 
         file_path = self._job_upload_path(job_id, upload_file.filename or "upload")
@@ -43,7 +57,15 @@ class JobService:
 
         self._update_job(
             job_id,
-            params={"file_path": str(file_path), "original_filename": upload_file.filename or "upload"},
+            params={
+                "file_path": str(file_path),
+                "original_filename": upload_file.filename or "upload",
+                **(
+                    {"import_dedup_mode": job_params["import_dedup_mode"]}
+                    if "import_dedup_mode" in job_params
+                    else {}
+                ),
+            },
             message="已接收文件，等待执行…",
         )
         self._submit(job_id)
@@ -204,6 +226,9 @@ class JobService:
         if not path.exists():
             raise RuntimeError("上传文件不存在，可能已被清理")
 
+        dedup = params.get("import_dedup_mode")
+        dedup_mode: str | None = dedup.strip().lower() if isinstance(dedup, str) else None
+
         with path.open("rb") as f:
             upload = UploadFile(filename=original_filename, file=f)
             try:
@@ -213,18 +238,26 @@ class JobService:
                         project_id,
                         job_id=job_id,
                         should_cancel=lambda: self._is_cancel_requested(job_id),
+                        import_dedup_mode=dedup_mode,
                     )
                 )
             except CancelledError:
                 self._update_job(job_id, status="cancelled", message="已取消", progress_current=0, progress_total=0)
                 return
 
+        if result.dedup_action == "skipped_duplicate":
+            done_message = "导入跳过：与已有文档内容重复（同项目同文件指纹）"
+        elif result.dedup_action == "replaced":
+            done_message = "导入完成（已覆盖同内容旧文档）"
+        else:
+            done_message = "导入完成"
+
         self._update_job(
             job_id,
             status="succeeded",
             progress_current=1,
             progress_total=1,
-            message="导入完成",
+            message=done_message,
             result=result.model_dump_json(ensure_ascii=False),
         )
 

@@ -105,9 +105,12 @@ def project_index_stats(project_id: int) -> ProjectIndexStats:
 async def create_import_job(
     file: UploadFile = File(...),
     project_id: int = Form(default=1, ge=1),
+    import_dedup_mode: str | None = Form(default=None),
 ) -> CreateJobResponse:
     _ensure_project(project_id)
-    res = await job_service.create_import_job(project_id, file)
+    res = await job_service.create_import_job(
+        project_id, file, import_dedup_mode=import_dedup_mode
+    )
     return CreateJobResponse(job_id=res.job_id)
 
 
@@ -184,10 +187,11 @@ def list_documents(project_id: int = Query(default=1, ge=1)):
 async def upload_document(
     file: UploadFile = File(...),
     project_id: int = Form(default=1, ge=1),
+    import_dedup_mode: str | None = Form(default=None),
 ) -> UploadResult:
     _ensure_project(project_id)
     try:
-        return await indexer.ingest_upload(file, project_id)
+        return await indexer.ingest_upload(file, project_id, import_dedup_mode=import_dedup_mode)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

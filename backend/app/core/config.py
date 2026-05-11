@@ -1,7 +1,10 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+ImportDedupMode = Literal["ignore", "overwrite", "keep"]
 
 
 class Settings(BaseSettings):
@@ -18,6 +21,9 @@ class Settings(BaseSettings):
     llm_api_key: str = "change-me-local-dev"
     llm_model: str = "hermes-agent"
     llm_timeout_seconds: int = 120
+
+    # 同项目同文件内容指纹：ignore 跳过重复；overwrite 删除旧记录后重新导入；keep 每次新增一条（可多版本并存）
+    import_dedup_mode: ImportDedupMode = "ignore"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

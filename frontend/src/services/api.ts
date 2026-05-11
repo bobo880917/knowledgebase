@@ -14,11 +14,14 @@ export type DocumentItem = {
   created_at: string;
 };
 
+export type UploadDedupMode = 'ignore' | 'overwrite' | 'keep';
+
 export type UploadResult = {
   document: DocumentItem;
   section_count: number;
   paragraph_count: number;
   chunk_count: number;
+  dedup_action?: 'imported' | 'skipped_duplicate' | 'replaced';
 };
 
 export type EmbeddingHealth = {
@@ -165,20 +168,34 @@ export function listDocuments(projectId: number): Promise<DocumentItem[]> {
   return request<DocumentItem[]>(`/api/documents?project_id=${projectId}`);
 }
 
-export function uploadDocument(file: File, projectId: number): Promise<UploadResult> {
+export function uploadDocument(
+  file: File,
+  projectId: number,
+  importDedupMode?: UploadDedupMode,
+): Promise<UploadResult> {
   const form = new FormData();
   form.append('file', file);
   form.append('project_id', String(projectId));
+  if (importDedupMode) {
+    form.append('import_dedup_mode', importDedupMode);
+  }
   return request<UploadResult>('/api/documents', {
     method: 'POST',
     body: form,
   });
 }
 
-export function createImportJob(file: File, projectId: number): Promise<CreateJobResponse> {
+export function createImportJob(
+  file: File,
+  projectId: number,
+  importDedupMode?: UploadDedupMode,
+): Promise<CreateJobResponse> {
   const form = new FormData();
   form.append('file', file);
   form.append('project_id', String(projectId));
+  if (importDedupMode) {
+    form.append('import_dedup_mode', importDedupMode);
+  }
   return request<CreateJobResponse>('/api/jobs/import', {
     method: 'POST',
     body: form,

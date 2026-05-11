@@ -82,6 +82,15 @@ DATABASE_PATH=./data/knowledge_base.db
 UPLOAD_DIR=./data/uploads
 ```
 
+### 导入去重（可选）
+
+同项目、同文件字节指纹下的行为，默认 `ignore`（跳过重复）。也可在「文档管理」上传时按次选择。
+
+```env
+# ignore | overwrite | keep
+IMPORT_DEDUP_MODE=ignore
+```
+
 ### Embedding（语义检索）
 
 开发验证也可以用简单 hash；正式语义检索建议开启 `sentence_transformers`：

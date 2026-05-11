@@ -25,6 +25,7 @@ import {
   type ProviderHealth,
   type ReindexResult,
   type SearchResponse,
+  type UploadDedupMode,
   type UploadResult,
 } from './services/api';
 
@@ -47,6 +48,7 @@ const provider = ref<ProviderHealth | null>(null);
 const embedding = ref<EmbeddingHealth | null>(null);
 const indexStats = ref<ProjectIndexStats | null>(null);
 const selectedFile = ref<File | null>(null);
+const importDedupMode = ref<UploadDedupMode>('ignore');
 const uploadResult = ref<UploadResult | null>(null);
 const reindexResult = ref<ReindexResult | null>(null);
 const newProjectName = ref('');
@@ -255,7 +257,7 @@ async function submitUpload() {
   uploading.value = true;
   error.value = '';
   try {
-    const res = await createImportJob(selectedFile.value, activeProjectId.value);
+    const res = await createImportJob(selectedFile.value, activeProjectId.value, importDedupMode.value);
     lastCreatedJobId.value = res.job_id;
     selectedFile.value = null;
     uploadResult.value = null;
@@ -327,7 +329,12 @@ function jobSecondaryText(job: JobItem) {
     return job.error || '执行失败';
   }
   if (job.type === 'import_document') {
-    if (job.status === 'succeeded') return '导入完成';
+    if (job.status === 'succeeded') {
+      const r = tryParseResult(job);
+      if (r?.dedup_action === 'skipped_duplicate') return '已跳过（内容重复）';
+      if (r?.dedup_action === 'replaced') return '已覆盖同内容旧文档';
+      return job.message || '导入完成';
+    }
     if (job.status === 'queued') return '等待执行…';
     if (job.status === 'running') return job.message || '执行中…';
   }
@@ -708,6 +715,14 @@ onBeforeUnmount(() => {
           <label class="dropzone">
             <input type="file" accept=".md,.txt,.docx,.pdf" @change="onFileChange" />
             <span>{{ selectedFile?.name || '选择一个知识文件' }}</span>
+          </label>
+          <label class="dedup-row">
+            <span class="muted">同项目重复内容</span>
+            <select v-model="importDedupMode" class="dedup-select">
+              <option value="ignore">跳过（保留已有）</option>
+              <option value="overwrite">覆盖旧文档</option>
+              <option value="keep">保留多份</option>
+            </select>
           </label>
           <button :disabled="!selectedFile || uploading" @click="submitUpload">
             {{ uploading ? '正在预处理...' : '上传并建立索引' }}

@@ -66,6 +66,7 @@ class UploadResult(BaseModel):
     section_count: int
     paragraph_count: int
     chunk_count: int
+    dedup_action: Literal["imported", "skipped_duplicate", "replaced"] = "imported"
 
 
 class EmbeddingHealth(BaseModel):

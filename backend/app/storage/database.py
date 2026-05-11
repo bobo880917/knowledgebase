@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS documents (
     file_type TEXT NOT NULL,
     source_path TEXT NOT NULL,
     content_hash TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -96,6 +97,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
 
 INDEXES = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_project_hash ON documents(project_id, content_hash);
+CREATE INDEX IF NOT EXISTS idx_documents_project_fingerprint ON documents(project_id, content_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_project_created_at ON jobs(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -142,6 +144,7 @@ def init_db() -> None:
         )
         _migrate_existing_database(conn)
         _migrate_embeddings_table(conn)
+        _migrate_documents_content_fingerprint(conn)
         _repair_legacy_document_foreign_keys(conn)
         conn.executescript(INDEXES)
         violations = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -173,6 +176,19 @@ def _migrate_embeddings_table(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE embeddings ADD COLUMN version TEXT NOT NULL DEFAULT ''")
 
 
+def _migrate_documents_content_fingerprint(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    if "content_fingerprint" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        """
+        UPDATE documents
+        SET content_fingerprint = content_hash
+        WHERE content_fingerprint = ''
+        """
+    )
+
+
 def _has_global_content_hash_unique(conn: sqlite3.Connection) -> bool:
     indexes = conn.execute("PRAGMA index_list(documents)").fetchall()
     for index in indexes:
@@ -199,6 +215,7 @@ def _rebuild_documents_table(conn: sqlite3.Connection, has_project_id: bool) -> 
             file_type TEXT NOT NULL,
             source_path TEXT NOT NULL,
             content_hash TEXT NOT NULL,
+            content_fingerprint TEXT NOT NULL DEFAULT '',
             summary TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -207,8 +224,8 @@ def _rebuild_documents_table(conn: sqlite3.Connection, has_project_id: bool) -> 
     )
     conn.execute(
         f"""
-        INSERT INTO documents(id, project_id, filename, file_type, source_path, content_hash, summary, created_at)
-        SELECT id, {project_expression}, filename, file_type, source_path, content_hash, summary, created_at
+        INSERT INTO documents(id, project_id, filename, file_type, source_path, content_hash, content_fingerprint, summary, created_at)
+        SELECT id, {project_expression}, filename, file_type, source_path, content_hash, content_hash, summary, created_at
         FROM documents_old
         """
     )
