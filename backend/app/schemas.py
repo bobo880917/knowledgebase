@@ -121,8 +121,10 @@ class SearchHit(BaseModel):
     rank_score: float
     vector_score: float
     keyword_score: float
+    bm25_score: float = 0.0
     match_type: str
     source_id: int
+    location_label: str | None = None
 
 
 class SourceSummary(BaseModel):
@@ -141,6 +143,7 @@ class SearchResponse(BaseModel):
     hits: list[SearchHit]
     sources: list[SourceSummary] = []
     answer: str | None = None
+    rag_skipped_reason: str | None = None
 
 
 class ProviderHealth(BaseModel):

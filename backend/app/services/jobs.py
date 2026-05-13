@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import sqlite3
+from urllib.parse import unquote, urlparse
+
+import httpx
 from fastapi import UploadFile
 
 from app.core.config import get_settings
@@ -67,6 +70,67 @@ class JobService:
                 ),
             },
             message="已接收文件，等待执行…",
+        )
+        self._submit(job_id)
+        return CreateJobResult(job_id=job_id)
+
+    async def create_import_url_job(
+        self,
+        project_id: int,
+        url: str,
+        *,
+        import_dedup_mode: str | None = None,
+    ) -> CreateJobResult:
+        raw = url.strip()
+        parsed = urlparse(raw)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("仅支持 http 或 https 链接")
+
+        async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
+            response = await client.get(raw)
+            response.raise_for_status()
+            content = response.content
+
+        path_name = Path(unquote(parsed.path)).name
+        filename = path_name if path_name else "page.html"
+        low = filename.lower()
+        if not low.endswith((".html", ".htm")):
+            filename = Path(filename).stem + ".html" if filename else "page.html"
+
+        job_params: dict[str, Any] = {
+            "original_filename": filename,
+            "source_url": raw,
+        }
+        if import_dedup_mode and import_dedup_mode.strip().lower() in (
+            "ignore",
+            "overwrite",
+            "keep",
+        ):
+            job_params["import_dedup_mode"] = import_dedup_mode.strip().lower()
+
+        job_id = self._create_job_row(
+            project_id=project_id,
+            job_type="import_document",
+            params=job_params,
+        )
+
+        file_path = self._job_upload_path(job_id, filename)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(content)
+
+        self._update_job(
+            job_id,
+            params={
+                "file_path": str(file_path),
+                "original_filename": filename,
+                "source_url": raw,
+                **(
+                    {"import_dedup_mode": job_params["import_dedup_mode"]}
+                    if "import_dedup_mode" in job_params
+                    else {}
+                ),
+            },
+            message="已抓取网页，等待执行…",
         )
         self._submit(job_id)
         return CreateJobResult(job_id=job_id)

@@ -1,14 +1,14 @@
 # Local Knowledge Base（本地知识库）
 
-一个本地知识库 MVP：支持上传文档（`md/txt/docx/pdf`），本地解析与索引检索，并可接入 **OpenAI-compatible** LLM 服务做 RAG 问答。
+一个本地知识库 MVP：支持上传文档（`md/txt/docx/pdf/html/xlsx/pptx`）或抓取网页 HTML，本地解析与索引检索（向量 + SQLite FTS5 BM25 融合），并可接入 **OpenAI-compatible** LLM 服务做带引用约束的 RAG 问答。
 
 后续优化清单见 [`ROADMAP.md`](ROADMAP.md)。
 
 ## 功能特性
 
-- **文档管理**：上传/列表/删除（按项目维度组织）
-- **本地索引与检索**：基于分层结构（标题/段落等）进行检索，返回命中片段与来源摘要
-- **RAG 问答**：检索命中后，调用 OpenAI-compatible Provider 生成答案
+- **文档管理**：上传/列表/删除（按项目维度组织）；支持 URL 导入网页正文
+- **本地索引与检索**：分层结构；向量相似度与 BM25 全文检索加权融合；命中展示段落/切片位置标签
+- **RAG 问答**：证据不足或无命中时拒答（不调 LLM）；有证据时要求回答带 `[n]` 引用并与检索上下文对齐
 - **Embedding 可选**：支持 `sentence-transformers`（默认模型示例为 `BAAI/bge-small-zh-v1.5`）
 
 ## 目录结构
@@ -35,9 +35,8 @@
 
 ```bash
 cd backend
-uv sync
-# 若要启用 sentence-transformers 语义 embedding：
-# uv sync --extra embedding
+uv sync --extra embedding
+# 若暂不安装语义模型（体积较大），可先用 `uv sync`，并将 `.env` 中 `EMBEDDING_PROVIDER` 设为 `hash`。
 
 cp .env.example .env
 uv run uvicorn app.main:app --reload --port 8000
@@ -90,6 +89,10 @@ UPLOAD_DIR=./data/uploads
 # ignore | overwrite | keep
 IMPORT_DEDUP_MODE=ignore
 ```
+
+### 全文检索（BM25）
+
+升级后若数据库中仍是旧版本数据，请在对应项目执行一次 **重建索引**，以便为既有切片/段落生成 SQLite FTS5 全文索引（否则 BM25 分数长期为 0，主要依赖向量与词面分）。
 
 ### Embedding（语义检索）
 

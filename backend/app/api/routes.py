@@ -1,8 +1,9 @@
 import sqlite3
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
-
+import httpx
 import json
+
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
 from app.schemas import (
     CreateJobResponse,
@@ -21,6 +22,7 @@ from app.schemas import (
     ReindexResult,
     UploadResult,
 )
+from app.core.config import get_settings
 from app.services.embeddings import EmbeddingService
 from app.services.indexer import DocumentIndexer
 from app.services.jobs import job_service
@@ -111,6 +113,24 @@ async def create_import_job(
     res = await job_service.create_import_job(
         project_id, file, import_dedup_mode=import_dedup_mode
     )
+    return CreateJobResponse(job_id=res.job_id)
+
+
+@router.post("/jobs/import-url", response_model=CreateJobResponse)
+async def create_import_url_job(
+    project_id: int = Form(default=1, ge=1),
+    url: str = Form(...),
+    import_dedup_mode: str | None = Form(default=None),
+) -> CreateJobResponse:
+    _ensure_project(project_id)
+    try:
+        res = await job_service.create_import_url_job(
+            project_id, url, import_dedup_mode=import_dedup_mode
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=400, detail=f"抓取网页失败：{exc}") from exc
     return CreateJobResponse(job_id=res.job_id)
 
 
@@ -216,17 +236,31 @@ async def search(request: SearchRequest) -> SearchResponse:
     hits = retrieval.search(request.query, request.project_id, request.top_k)
     sources = _build_sources(hits)
     answer = None
-    if request.mode == "rag" and hits:
-        try:
-            answer = await llm_provider.answer(request.query, hits)
-        except Exception as exc:
-            answer = f"已完成检索，但调用 LLM Provider 失败：{exc}"
+    rag_skipped_reason = None
+    settings = get_settings()
+    if request.mode == "rag":
+        min_score = float(settings.rag_min_evidence_score)
+        if not hits:
+            answer = "未在知识库中找到与问题相关的可靠片段，无法作答。请确认当前项目已导入相关文档或换个问法。"
+            rag_skipped_reason = "no_hits"
+        elif hits[0].rank_score < min_score:
+            answer = (
+                "检索到的内容与问题关联度不足（低于系统可信度阈值），无法基于知识库给出可靠结论。"
+                "建议补充关键词、缩小问题范围或导入更匹配的文档。"
+            )
+            rag_skipped_reason = "low_evidence_score"
+        else:
+            try:
+                answer = await llm_provider.answer(request.query, hits)
+            except Exception as exc:
+                answer = f"已完成检索，但调用 LLM Provider 失败：{exc}"
     return SearchResponse(
         query=request.query,
         mode=request.mode,
         hits=hits,
         sources=sources,
         answer=answer,
+        rag_skipped_reason=rag_skipped_reason,
     )
 
 

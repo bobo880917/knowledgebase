@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     # 同项目同文件内容指纹：ignore 跳过重复；overwrite 删除旧记录后重新导入；keep 每次新增一条（可多版本并存）
     import_dedup_mode: ImportDedupMode = "ignore"
 
+    # 检索融合：向量 + BM25(FTS5) + 简单词面重合（三者之和应为 1）
+    retrieval_vector_weight: float = 0.52
+    retrieval_bm25_weight: float = 0.38
+    retrieval_keyword_weight: float = 0.10
+
+    # RAG：最佳命中 fused 分低于此阈值则不调 LLM，直接返回「未找到足够依据」
+    rag_min_evidence_score: float = 0.14
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     def ensure_dirs(self) -> None:

@@ -25,10 +25,12 @@ class LLMProvider:
     async def answer(self, query: str, hits: list[SearchHit]) -> str:
         context = self._build_context(hits)
         system_prompt = (
-            "你是一个本地知识库问答助手。只能基于用户提供的检索上下文回答。"
-            "如果上下文不足，请明确说明没有找到足够依据。回答需要简洁，并在句末标注来源编号。"
+            "你是本地知识库问答助手。你只能使用下方「检索上下文」中的内容作答，禁止编造事实或使用上下文外的知识。"
+            "若上下文不足以得出结论，必须明确回复「根据当前检索结果无法确定」，并简述缺失什么信息。"
+            "回答要点须标注引用编号，格式为 [1][2] 对应上下文条目序号。"
+            "引用编号只能来自检索上下文已给出的序号，不得虚构。"
         )
-        user_prompt = f"问题：{query}\n\n检索上下文：\n{context}"
+        user_prompt = f"用户问题：{query}\n\n检索上下文（条目序号即引用编号）：\n{context}"
         payload = {
             "model": self.settings.llm_model,
             "messages": [
@@ -60,5 +62,7 @@ class LLMProvider:
             source = f"[{index}] 文件：{hit.document_name}"
             if hit.section_title:
                 source += f"；章节：{hit.section_title}"
+            if hit.location_label:
+                source += f"；位置：{hit.location_label}"
             lines.append(f"{source}\n{hit.text}")
         return "\n\n".join(lines)

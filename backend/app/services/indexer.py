@@ -10,6 +10,7 @@ from collections.abc import Callable
 from app.core.config import get_settings
 from app.schemas import DocumentOut, ProjectIndexStats, ReindexResult, UploadResult
 from app.services.embeddings import EmbeddingService
+from app.services.fts_index import delete_document_rows, delete_project_rows, insert_entity_row
 from app.services.parsers import SUPPORTED_EXTENSIONS, parse_document
 from app.services.text_utils import chunk_text, summarize_text
 from app.storage.database import get_db
@@ -149,7 +150,14 @@ class DocumentIndexer:
                 )
                 section_id = int(section_cursor.lastrowid)
                 section_count += 1
-                self._insert_embedding(conn, "section", section_id, f"{section.title}\n{section_summary}")
+                self._insert_embedding(
+                    conn,
+                    "section",
+                    section_id,
+                    f"{section.title}\n{section_summary}",
+                    project_id=project_id,
+                    document_id=document_id,
+                )
                 embedded_so_far += 1
                 if job_id and (embedded_so_far % 20 == 0 or embedded_so_far == expected_embeddings):
                     self._update_job_progress_conn(
@@ -176,7 +184,14 @@ class DocumentIndexer:
                     )
                     paragraph_id = int(paragraph_cursor.lastrowid)
                     paragraph_count += 1
-                    self._insert_embedding(conn, "paragraph", paragraph_id, f"{section.title}\n{paragraph_summary}")
+                    self._insert_embedding(
+                        conn,
+                        "paragraph",
+                        paragraph_id,
+                        f"{section.title}\n{paragraph_summary}",
+                        project_id=project_id,
+                        document_id=document_id,
+                    )
                     embedded_so_far += 1
                     if job_id and (embedded_so_far % 20 == 0 or embedded_so_far == expected_embeddings):
                         self._update_job_progress_conn(
@@ -199,7 +214,14 @@ class DocumentIndexer:
                         )
                         chunk_id = int(chunk_cursor.lastrowid)
                         chunk_count += 1
-                        self._insert_embedding(conn, "chunk", chunk_id, f"{section.title}\n{text_chunk}")
+                        self._insert_embedding(
+                            conn,
+                            "chunk",
+                            chunk_id,
+                            f"{section.title}\n{text_chunk}",
+                            project_id=project_id,
+                            document_id=document_id,
+                        )
                         embedded_so_far += 1
                         if job_id and (embedded_so_far % 20 == 0 or embedded_so_far == expected_embeddings):
                             self._update_job_progress_conn(
@@ -286,6 +308,7 @@ class DocumentIndexer:
             ).fetchone()
             if not row:
                 return False
+            delete_document_rows(conn, document_id)
             conn.execute("DELETE FROM embeddings WHERE entity_id IN (SELECT id FROM sections WHERE document_id = ?) AND entity_type = 'section'", (document_id,))
             conn.execute("DELETE FROM embeddings WHERE entity_id IN (SELECT id FROM paragraphs WHERE document_id = ?) AND entity_type = 'paragraph'", (document_id,))
             conn.execute("DELETE FROM embeddings WHERE entity_id IN (SELECT id FROM chunks WHERE document_id = ?) AND entity_type = 'chunk'", (document_id,))
@@ -418,7 +441,16 @@ class DocumentIndexer:
             indexed=expected_embedding_count > 0 and embedding_count_active == expected_embedding_count,
         )
 
-    def _insert_embedding(self, conn, entity_type: str, entity_id: int, text: str) -> None:
+    def _insert_embedding(
+        self,
+        conn,
+        entity_type: str,
+        entity_id: int,
+        text: str,
+        *,
+        project_id: int | None = None,
+        document_id: int | None = None,
+    ) -> None:
         vector = self.embedding.embed(text)
         provider = self.settings.embedding_provider
         model = self.settings.embedding_model
@@ -432,6 +464,15 @@ class DocumentIndexer:
             """,
             (entity_type, entity_id, text, self.embedding.dumps(vector), provider, model, dimension, version),
         )
+        if project_id is not None and document_id is not None:
+            insert_entity_row(
+                conn,
+                project_id=project_id,
+                document_id=document_id,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                body=text,
+            )
 
     def _reindex_sections(
         self,
@@ -446,7 +487,7 @@ class DocumentIndexer:
     ) -> int:
         rows = conn.execute(
             """
-            SELECT s.id, s.title, s.summary
+            SELECT s.id, s.document_id, s.title, s.summary
             FROM sections s
             JOIN documents d ON d.id = s.document_id
             WHERE d.project_id = ?
@@ -463,6 +504,8 @@ class DocumentIndexer:
                 "section",
                 row["id"],
                 f"{row['title']}\n{row['summary']}",
+                project_id=project_id,
+                document_id=int(row["document_id"]),
             )
             tick = total is not None and DocumentIndexer._reindex_emit_progress_tick(index, len(rows))
             if tick and job_id:
@@ -490,7 +533,7 @@ class DocumentIndexer:
     ) -> int:
         rows = conn.execute(
             """
-            SELECT p.id, p.summary, s.title AS section_title
+            SELECT p.id, p.document_id, p.summary, s.title AS section_title
             FROM paragraphs p
             JOIN documents d ON d.id = p.document_id
             LEFT JOIN sections s ON s.id = p.section_id
@@ -508,6 +551,8 @@ class DocumentIndexer:
                 "paragraph",
                 row["id"],
                 f"{row['section_title'] or ''}\n{row['summary']}",
+                project_id=project_id,
+                document_id=int(row["document_id"]),
             )
             tick = total is not None and DocumentIndexer._reindex_emit_progress_tick(index, len(rows))
             if tick and job_id:
@@ -535,7 +580,7 @@ class DocumentIndexer:
     ) -> int:
         rows = conn.execute(
             """
-            SELECT c.id, c.text, s.title AS section_title
+            SELECT c.id, c.document_id, c.text, s.title AS section_title
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
             LEFT JOIN sections s ON s.id = c.section_id
@@ -553,6 +598,8 @@ class DocumentIndexer:
                 "chunk",
                 row["id"],
                 f"{row['section_title'] or ''}\n{row['text']}",
+                project_id=project_id,
+                document_id=int(row["document_id"]),
             )
             tick = total is not None and DocumentIndexer._reindex_emit_progress_tick(index, len(rows))
             if tick and job_id:
@@ -611,6 +658,7 @@ class DocumentIndexer:
 
     @staticmethod
     def _delete_project_embeddings(conn, project_id: int) -> None:
+        delete_project_rows(conn, project_id)
         conn.execute(
             """
             DELETE FROM embeddings

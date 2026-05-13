@@ -4,6 +4,7 @@ import {
   cancelJob,
   createProject,
   createImportJob,
+  createImportUrlJob,
   createReindexJob,
   deleteDocument,
   deleteProject,
@@ -49,6 +50,8 @@ const embedding = ref<EmbeddingHealth | null>(null);
 const indexStats = ref<ProjectIndexStats | null>(null);
 const selectedFile = ref<File | null>(null);
 const importDedupMode = ref<UploadDedupMode>('ignore');
+const importUrl = ref('');
+const urlImporting = ref(false);
 const uploadResult = ref<UploadResult | null>(null);
 const reindexResult = ref<ReindexResult | null>(null);
 const newProjectName = ref('');
@@ -249,6 +252,24 @@ async function rebuildCurrentProjectIndex() {
     error.value = err instanceof Error ? err.message : '创建重建索引任务失败';
   } finally {
     reindexing.value = false;
+  }
+}
+
+async function submitUrlImport() {
+  if (!importUrl.value.trim()) return;
+  urlImporting.value = true;
+  error.value = '';
+  try {
+    const res = await createImportUrlJob(importUrl.value.trim(), activeProjectId.value, importDedupMode.value);
+    lastCreatedJobId.value = res.job_id;
+    importUrl.value = '';
+    currentView.value = 'jobs';
+    jobsPage.value = 1;
+    await refreshJobs();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '从 URL 导入失败';
+  } finally {
+    urlImporting.value = false;
   }
 }
 
@@ -708,12 +729,18 @@ onBeforeUnmount(() => {
           <div class="section-heading">
             <div>
               <h2>导入文档</h2>
-              <p class="muted">当前项目：{{ activeProject?.name }}。第一阶段支持 md、txt、docx、pdf。</p>
+              <p class="muted">
+                当前项目：{{ activeProject?.name }}。支持 md、txt、docx、pdf、html、xlsx、pptx；亦可填写 URL 抓取网页正文。
+              </p>
             </div>
           </div>
 
           <label class="dropzone">
-            <input type="file" accept=".md,.txt,.docx,.pdf" @change="onFileChange" />
+            <input
+              type="file"
+              accept=".md,.txt,.docx,.pdf,.html,.htm,.xlsx,.pptx"
+              @change="onFileChange"
+            />
             <span>{{ selectedFile?.name || '选择一个知识文件' }}</span>
           </label>
           <label class="dedup-row">
@@ -727,6 +754,21 @@ onBeforeUnmount(() => {
           <button :disabled="!selectedFile || uploading" @click="submitUpload">
             {{ uploading ? '正在预处理...' : '上传并建立索引' }}
           </button>
+
+          <div class="url-import-block">
+            <span class="muted">或抓取网页（保存为 HTML 后解析正文）</span>
+            <div class="url-import-row">
+              <input
+                v-model="importUrl"
+                type="url"
+                class="url-input"
+                placeholder="https://example.com/page"
+              />
+              <button type="button" :disabled="urlImporting || !importUrl.trim()" @click="submitUrlImport">
+                {{ urlImporting ? '抓取中...' : '从 URL 导入' }}
+              </button>
+            </div>
+          </div>
 
           <div v-if="uploadResult" class="upload-result">
             <strong>{{ uploadResult.document.filename }}</strong>
@@ -900,6 +942,9 @@ onBeforeUnmount(() => {
         <article v-if="result?.answer" class="answer-card panel">
           <span>模型回答</span>
           <p>{{ result.answer }}</p>
+          <p v-if="result.rag_skipped_reason" class="muted" style="margin-top: 8px">
+            （未调用 LLM：{{ result.rag_skipped_reason === 'no_hits' ? '无命中' : '证据不足' }}）
+          </p>
           <div v-if="result.sources.length" class="source-list">
             <strong>本次回答引用来源</strong>
             <div v-for="source in result.sources" :key="`${source.document_id}-${source.section_title}-${source.match_type}`">
@@ -914,7 +959,7 @@ onBeforeUnmount(() => {
           <div class="section-heading">
             <div>
               <h2>命中结果</h2>
-              <p class="muted">展开调试信息可以查看总分、向量分和关键词分。</p>
+              <p class="muted">展开调试信息可查看融合总分、向量分、BM25（全文）与简单词面分。</p>
             </div>
           </div>
 
@@ -925,14 +970,16 @@ onBeforeUnmount(() => {
             </div>
             <h4>{{ hit.document_name }}</h4>
             <p v-if="hit.section_title" class="section-title">{{ hit.section_title }}</p>
+            <p v-if="hit.location_label" class="muted location-label">{{ hit.location_label }}</p>
             <p>{{ hit.text }}</p>
             <details class="debug-panel">
               <summary>查看检索调试信息</summary>
               <div class="score-grid">
                 <span>项目</span><strong>{{ hit.project_name }}</strong>
-                <span>总分</span><strong>{{ hit.rank_score }}</strong>
+                <span>融合分</span><strong>{{ hit.rank_score }}</strong>
                 <span>向量分</span><strong>{{ hit.vector_score }}</strong>
-                <span>关键词分</span><strong>{{ hit.keyword_score }}</strong>
+                <span>BM25</span><strong>{{ hit.bm25_score ?? 0 }}</strong>
+                <span>词面分</span><strong>{{ hit.keyword_score }}</strong>
               </div>
             </details>
           </article>

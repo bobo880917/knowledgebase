@@ -524,6 +524,36 @@ h3 {
   color: #efead8;
 }
 
+.url-import-block {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(229, 177, 95, 0.15);
+}
+
+.url-import-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.url-input {
+  flex: 1 1 220px;
+  min-width: 180px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(229, 177, 95, 0.35);
+  background: rgba(26, 18, 12, 0.85);
+  color: #efead8;
+}
+
+.location-label {
+  font-size: 0.88rem;
+  margin: 4px 0 0;
+}
+
 .upload-card > button,
 .query-box button {
   width: 100%;

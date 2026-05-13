@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from app.core.config import get_settings
+from app.services.fts_index import migrate_entity_fts
 
 
 SCHEMA = """
@@ -145,6 +146,7 @@ def init_db() -> None:
         _migrate_existing_database(conn)
         _migrate_embeddings_table(conn)
         _migrate_documents_content_fingerprint(conn)
+        migrate_entity_fts(conn)
         _repair_legacy_document_foreign_keys(conn)
         conn.executescript(INDEXES)
         violations = conn.execute("PRAGMA foreign_key_check").fetchall()

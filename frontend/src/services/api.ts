@@ -69,8 +69,10 @@ export type SearchHit = {
   rank_score: number;
   vector_score: number;
   keyword_score: number;
+  bm25_score: number;
   match_type: string;
   source_id: number;
+  location_label?: string | null;
 };
 
 export type SourceSummary = {
@@ -89,6 +91,7 @@ export type SearchResponse = {
   hits: SearchHit[];
   sources: SourceSummary[];
   answer: string | null;
+  rag_skipped_reason?: string | null;
 };
 
 export type ProviderHealth = {
@@ -197,6 +200,23 @@ export function createImportJob(
     form.append('import_dedup_mode', importDedupMode);
   }
   return request<CreateJobResponse>('/api/jobs/import', {
+    method: 'POST',
+    body: form,
+  });
+}
+
+export function createImportUrlJob(
+  url: string,
+  projectId: number,
+  importDedupMode?: UploadDedupMode,
+): Promise<CreateJobResponse> {
+  const form = new FormData();
+  form.append('url', url);
+  form.append('project_id', String(projectId));
+  if (importDedupMode) {
+    form.append('import_dedup_mode', importDedupMode);
+  }
+  return request<CreateJobResponse>('/api/jobs/import-url', {
     method: 'POST',
     body: form,
   });

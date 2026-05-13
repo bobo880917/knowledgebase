@@ -1,8 +1,10 @@
 import re
 from dataclasses import dataclass
 
+from app.core.config import get_settings
 from app.schemas import SearchHit
 from app.services.embeddings import EmbeddingService, cosine_similarity
+from app.services.fts_index import build_fts_match, build_fts_match_token_and, search_bm25
 from app.storage.database import get_db
 
 
@@ -17,39 +19,90 @@ class Candidate:
     rank_score: float
     vector_score: float
     keyword_score: float
+    bm25_score: float
     match_type: str
     source_id: int
+    location_label: str | None
 
 
 class RetrievalService:
     def __init__(self) -> None:
         self.embedding = EmbeddingService()
+        self.settings = get_settings()
 
     def search(self, query: str, project_id: int, top_k: int = 8) -> list[SearchHit]:
         query_vector = self.embedding.embed(query)
         tokens = _query_tokens(query)
-        candidates: list[Candidate] = []
 
+        bm25_map: dict[tuple[str, int], float] = {}
         with get_db() as conn:
+            match_expr = build_fts_match(query)
+            fts_rows: list[tuple[str, int, float]] = []
+            if match_expr:
+                fts_rows = search_bm25(conn, project_id, match_expr, limit=120)
+            if not fts_rows:
+                alt = build_fts_match_token_and(query)
+                if alt:
+                    fts_rows = search_bm25(conn, project_id, alt, limit=120)
+            max_bm25 = max((t[2] for t in fts_rows), default=0.0)
+            for entity_type, entity_id, qual in fts_rows:
+                key = (entity_type, entity_id)
+                if key not in bm25_map or qual > bm25_map[key]:
+                    bm25_map[key] = qual
+
             embedding_rows = conn.execute(
-                "SELECT entity_type, entity_id, text, vector FROM embeddings"
+                """
+                SELECT e.entity_type, e.entity_id, e.text, e.vector
+                FROM embeddings e
+                WHERE
+                  (e.entity_type = 'section' AND e.entity_id IN (
+                      SELECT s.id FROM sections s
+                      JOIN documents d ON d.id = s.document_id
+                      WHERE d.project_id = ?
+                  ))
+                  OR (e.entity_type = 'paragraph' AND e.entity_id IN (
+                      SELECT p.id FROM paragraphs p
+                      JOIN documents d ON d.id = p.document_id
+                      WHERE d.project_id = ?
+                  ))
+                  OR (e.entity_type = 'chunk' AND e.entity_id IN (
+                      SELECT c.id FROM chunks c
+                      JOIN documents d ON d.id = c.document_id
+                      WHERE d.project_id = ?
+                  ))
+                """,
+                (project_id, project_id, project_id),
             ).fetchall()
 
+            w_vec = float(self.settings.retrieval_vector_weight)
+            w_bm25 = float(self.settings.retrieval_bm25_weight)
+            w_kw = float(self.settings.retrieval_keyword_weight)
+            total_w = w_vec + w_bm25 + w_kw
+            if total_w <= 0:
+                total_w = 1.0
+
+            candidates: list[Candidate] = []
             for row in embedding_rows:
                 vector_score = cosine_similarity(query_vector, self.embedding.loads(row["vector"]))
                 keyword_score = _keyword_score(tokens, row["text"])
+                key = (row["entity_type"], int(row["entity_id"]))
+                raw_bm25 = bm25_map.get(key, 0.0)
+                bm25_norm = raw_bm25 / max_bm25 if max_bm25 > 0 else 0.0
                 weight = _entity_weight(row["entity_type"])
-                rank_score = (vector_score * 0.72 + keyword_score * 0.28) * weight
-                if rank_score <= 0:
+                fused = (
+                    w_vec * vector_score + w_bm25 * bm25_norm + w_kw * keyword_score
+                ) / total_w * weight
+                if fused <= 0:
                     continue
                 candidate = self._hydrate_candidate(
                     conn,
                     row["entity_type"],
-                    row["entity_id"],
+                    int(row["entity_id"]),
                     project_id,
-                    rank_score,
+                    fused,
                     vector_score,
                     keyword_score,
+                    bm25_norm,
                 )
                 if candidate:
                     candidates.append(candidate)
@@ -68,8 +121,10 @@ class RetrievalService:
                 rank_score=round(float(item.rank_score), 4),
                 vector_score=round(float(item.vector_score), 4),
                 keyword_score=round(float(item.keyword_score), 4),
+                bm25_score=round(float(item.bm25_score), 4),
                 match_type=item.match_type,
                 source_id=item.source_id,
+                location_label=item.location_label,
             )
             for item in ranked
         ]
@@ -83,6 +138,7 @@ class RetrievalService:
         rank_score: float,
         vector_score: float,
         keyword_score: float,
+        bm25_score: float,
     ) -> Candidate | None:
         if entity_type == "section":
             row = conn.execute(
@@ -94,7 +150,8 @@ class RetrievalService:
                     d.filename,
                     s.id,
                     s.title,
-                    s.summary
+                    s.summary,
+                    s.order_index
                 FROM sections s
                 JOIN documents d ON d.id = s.document_id
                 JOIN projects p ON p.id = d.project_id
@@ -105,6 +162,7 @@ class RetrievalService:
             if not row:
                 return None
             text = f"{row['title']}\n{row['summary']}".strip()
+            loc = f"章节「{row['title']}」" if row["title"] else "章节"
             return Candidate(
                 row["project_id"],
                 row["project_name"],
@@ -115,8 +173,10 @@ class RetrievalService:
                 rank_score,
                 vector_score,
                 keyword_score,
+                bm25_score,
                 "section",
                 row["id"],
+                loc,
             )
 
         if entity_type == "paragraph":
@@ -129,6 +189,7 @@ class RetrievalService:
                     d.filename,
                     p.id,
                     p.text,
+                    p.order_index,
                     s.title AS section_title
                 FROM paragraphs p
                 JOIN documents d ON d.id = p.document_id
@@ -140,6 +201,9 @@ class RetrievalService:
             ).fetchone()
             if not row:
                 return None
+            ord_i = int(row["order_index"])
+            sec = row["section_title"] or ""
+            loc = f"{sec + ' · ' if sec else ''}段落 {ord_i + 1}"
             return Candidate(
                 row["project_id"],
                 row["project_name"],
@@ -150,8 +214,10 @@ class RetrievalService:
                 rank_score,
                 vector_score,
                 keyword_score,
+                bm25_score,
                 "paragraph",
                 row["id"],
+                loc,
             )
 
         if entity_type == "chunk":
@@ -164,6 +230,7 @@ class RetrievalService:
                     d.filename,
                     c.id,
                     c.text,
+                    c.order_index,
                     s.title AS section_title
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
@@ -175,6 +242,9 @@ class RetrievalService:
             ).fetchone()
             if not row:
                 return None
+            ord_i = int(row["order_index"])
+            sec = row["section_title"] or ""
+            loc = f"{sec + ' · ' if sec else ''}切片 {ord_i + 1}"
             return Candidate(
                 row["project_id"],
                 row["project_name"],
@@ -185,8 +255,10 @@ class RetrievalService:
                 rank_score,
                 vector_score,
                 keyword_score,
+                bm25_score,
                 "chunk",
                 row["id"],
+                loc,
             )
 
         return None
