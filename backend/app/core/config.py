@@ -33,6 +33,23 @@ class Settings(BaseSettings):
     # RAG：最佳命中 fused 分低于此阈值则不调 LLM，直接返回「未找到足够依据」
     rag_min_evidence_score: float = 0.14
 
+    # OCR（可选）：扫描 PDF / 图片需 OCR_ENABLED=true，并 uv sync --extra ocr + 本机 Tesseract
+    ocr_enabled: bool = False
+    ocr_lang: str = "chi_sim+eng"
+    ocr_tesseract_cmd: str = ""
+    ocr_pdf_min_text_chars: int = 80
+    ocr_pdf_max_pages: int = 30
+    # 渲染页图分辨率；中文小字标准类 PDF 建议 300
+    ocr_pdf_dpi: int = 300
+    # 为 True 时忽略 pypdf 文字层，始终对 PDF 做渲染 + OCR（解决「有文字层但实为乱码」的国标/扫描混排）
+    ocr_pdf_force_visual: bool = False
+    # 大于 0 时：若文字层已够长但 CJK 占比低于该值，则改走 OCR（0 表示关闭此启发式）
+    ocr_pdf_min_cjk_ratio: float = 0.0
+    # 传给 Tesseract 的额外参数，例如 --psm 6（单块正文）；留空则使用 Tesseract 默认
+    ocr_tesseract_config: str = ""
+    # 识别前灰度 + 自动对比度，常能改善扫描件/浅字
+    ocr_preprocess_autocontrast: bool = True
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     def ensure_dirs(self) -> None:

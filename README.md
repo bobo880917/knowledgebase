@@ -1,12 +1,15 @@
 # Local Knowledge Base（本地知识库）
 
-一个本地知识库 MVP：支持上传文档（`md/txt/docx/pdf/html/xlsx/pptx`）或抓取网页 HTML，本地解析与索引检索（向量 + SQLite FTS5 BM25 融合），并可接入 **OpenAI-compatible** LLM 服务做带引用约束的 RAG 问答。
+一个本地知识库 MVP：支持上传文档（`md/txt/docx/pdf/html/xlsx/pptx` 及常见图片）或抓取网页 HTML，本地解析与索引检索（向量 + SQLite FTS5 BM25 融合），并可接入 **OpenAI-compatible** LLM 服务做带引用约束的 RAG 问答。扫描 PDF 与图片在启用 OCR 后由 Tesseract 识别为文本再入库。
 
 后续优化清单见 [`ROADMAP.md`](ROADMAP.md)。
 
 ## 功能特性
 
-- **文档管理**：上传/列表/删除（按项目维度组织）；支持 URL 导入网页正文
+- **文档管理**：上传/列表/删除（按项目）；支持 URL 导入网页正文；可选 OCR 导入扫描 PDF 与图片。
+- **多轮对话（按项目）**：RAG 自动记录用户/助手消息，检索时可勾选携带近期对话摘要；切换项目后对话隔离。
+- **文档标签与检索过滤**：项目内标签管理、文档打标；检索支持按标签（AND）、文件类型、创建日期区间过滤。
+- **文档详情**：章节树与段落正文；从命中结果一键打开并高亮对应章节/段落。
 - **本地索引与检索**：分层结构；向量相似度与 BM25 全文检索加权融合；命中展示段落/切片位置标签
 - **RAG 问答**：证据不足或无命中时拒答（不调 LLM）；有证据时要求回答带 `[n]` 引用并与检索上下文对齐
 - **Embedding 可选**：支持 `sentence-transformers`（默认模型示例为 `BAAI/bge-small-zh-v1.5`）
@@ -36,6 +39,7 @@
 ```bash
 cd backend
 uv sync --extra embedding
+# 可选：扫描 PDF / 图片 OCR 需 `uv sync --extra ocr` 与本机 Tesseract。
 # 若暂不安装语义模型（体积较大），可先用 `uv sync`，并将 `.env` 中 `EMBEDDING_PROVIDER` 设为 `hash`。
 
 cp .env.example .env
@@ -106,6 +110,33 @@ EMBEDDING_DIMENSION=512
 
 > 如果你没有安装 embedding 依赖，请执行：`pip install -e ".[embedding]"`。
 
+### OCR（扫描 PDF / 图片）
+
+1. 本机安装 [Tesseract](https://github.com/tesseract-ocr/tesseract) 及所需语言包（例如中文简体 `chi_sim`）。
+2. 安装 Python 可选依赖：`uv sync --extra ocr` 或 `pip install -e ".[ocr]"`。
+3. 在 `.env` 中启用并按需调整：
+
+```env
+OCR_ENABLED=true
+OCR_LANG=chi_sim+eng
+# 可选：非默认路径时指定 tesseract 可执行文件
+# OCR_TESSERACT_CMD=/opt/homebrew/bin/tesseract
+# 正文少于该字符数则对 PDF 走渲染+OCR（可调大以减少误判）
+OCR_PDF_MIN_TEXT_CHARS=80
+OCR_PDF_MAX_PAGES=30
+OCR_PDF_DPI=300
+```
+
+识别结果会写入 `documents.ocr_meta`（JSON，便于回溯），并在 `UPLOAD_DIR/ocr_cache/` 下按内容哈希缓存。健康检查：`GET /api/ocr/health`。
+
+#### 中文 PDF / 国标类「乱码」排查
+
+1. **先确认是不是文字层假阳性**：部分电子版用 pypdf 能抽出「很长一段」但实为乱码，系统会误判为「已有正文」而不走 OCR。可在 `.env` 设置 **`OCR_PDF_FORCE_VISUAL=true`**（须 **`OCR_ENABLED=true`**），删除旧文档后重新导入，强制按页渲染再识别。
+2. **语言包**：`tesseract --list-langs` 中需包含 **`chi_sim`**（简体）。macOS 常见为 `brew install tesseract-lang`。
+3. **分辨率**：将 **`OCR_PDF_DPI`** 提到 **300** 或 **400**（更慢但更清晰）。
+4. **启发式**：若不想全局强制视觉 OCR，可设 **`OCR_PDF_MIN_CJK_RATIO=0.06`** 等：文字层够长但汉字占比过低时自动改走 OCR（纯英文长文请勿设过高，或临时把 `OCR_LANG` 改为 `eng`）。
+5. **清缓存**：改过 DPI/语言/Tesseract 参数后，删除 `UPLOAD_DIR/ocr_cache/` 下对应缓存或整目录，再重新导入。
+
 ### LLM Provider（OpenAI-compatible）
 
 ```env
@@ -143,6 +174,7 @@ LLM_MODEL=hermes-agent
   - `GET /api/health`
   - `GET /api/provider/health`
   - `GET /api/embedding/health`
+  - `GET /api/ocr/health`
 - **项目**
   - `GET /api/projects`
   - `POST /api/projects`
@@ -150,12 +182,16 @@ LLM_MODEL=hermes-agent
   - `DELETE /api/projects/{project_id}`
   - `POST /api/projects/{project_id}/reindex`
   - `GET /api/projects/{project_id}/index-stats`
+  - `GET /api/projects/{project_id}/tags` · `POST /api/projects/{project_id}/tags` · `DELETE /api/projects/{project_id}/tags/{tag_id}`
+  - `GET /api/projects/{project_id}/chat` · `POST /api/projects/{project_id}/chat` · `DELETE /api/projects/{project_id}/chat`
 - **文档**
   - `GET /api/documents?project_id=1`
   - `POST /api/documents`（multipart/form-data：`file` + `project_id`）
   - `DELETE /api/documents/{document_id}?project_id=1`
+  - `GET /api/documents/{document_id}/detail?project_id=1`（章节树 + 段落）
+  - `PATCH /api/documents/{document_id}/tags?project_id=1`（JSON：`{ "tag_ids": [1,2] }`）
 - **检索 / 问答**
-  - `POST /api/search`（`mode=search|rag`）
+  - `POST /api/search`（`mode=search|rag`；可选 `tag_ids`、`file_types`、`created_after`、`created_before`、`rag_use_chat_history`）
 
 ## 常见问题
 

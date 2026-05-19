@@ -22,6 +22,12 @@ embedding = [
     "sentence-transformers>=3.0.0",
 ]
 
+ocr = [
+    "pymupdf>=1.24.0",
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0.0",
+]
+
 [tool.ruff]
 line-length = 100
 

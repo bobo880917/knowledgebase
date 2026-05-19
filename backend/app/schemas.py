@@ -59,6 +59,8 @@ class DocumentOut(BaseModel):
     file_type: str
     summary: str
     created_at: str
+    tags: list[str] = Field(default_factory=list)
+    ocr_meta: str = ""
 
 
 class UploadResult(BaseModel):
@@ -75,6 +77,13 @@ class EmbeddingHealth(BaseModel):
     dimension: int
     semantic_enabled: bool
     ok: bool
+    message: str
+
+
+class OcrHealth(BaseModel):
+    enabled: bool
+    ok: bool
+    engine: str
     message: str
 
 
@@ -108,6 +117,64 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
     mode: Literal["search", "rag"] = "search"
     top_k: int = Field(default=8, ge=1, le=30)
+    tag_ids: list[int] = Field(default_factory=list)
+    file_types: list[str] = Field(default_factory=list)
+    created_after: str | None = None
+    created_before: str | None = None
+    rag_use_chat_history: bool = True
+
+
+class TagOut(BaseModel):
+    id: int
+    project_id: int
+    name: str
+    created_at: str
+
+
+class TagCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+
+
+class DocumentTagsPatch(BaseModel):
+    tag_ids: list[int] = Field(default_factory=list)
+
+
+class ChatMessageOut(BaseModel):
+    id: int
+    project_id: int
+    role: str
+    content: str
+    created_at: str
+
+
+class ChatAppend(BaseModel):
+    role: Literal["user", "assistant", "system"] = "user"
+    content: str = Field(min_length=1, max_length=32000)
+
+
+class ParagraphDetailOut(BaseModel):
+    id: int
+    order_index: int
+    text: str
+    summary: str
+    chunk_count: int = 0
+
+
+class SectionDetailOut(BaseModel):
+    id: int
+    order_index: int
+    title: str
+    level: int
+    summary: str
+    paragraphs: list[ParagraphDetailOut] = Field(default_factory=list)
+
+
+class DocumentDetailOut(BaseModel):
+    document: DocumentOut
+    sections: list[SectionDetailOut] = Field(default_factory=list)
+    section_count: int = 0
+    paragraph_count: int = 0
+    chunk_count: int = 0
 
 
 class SearchHit(BaseModel):

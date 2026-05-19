@@ -12,6 +12,8 @@ export type DocumentItem = {
   file_type: string;
   summary: string;
   created_at: string;
+  tags?: string[];
+  ocr_meta?: string;
 };
 
 export type UploadDedupMode = 'ignore' | 'overwrite' | 'keep';
@@ -30,6 +32,13 @@ export type EmbeddingHealth = {
   dimension: number;
   semantic_enabled: boolean;
   ok: boolean;
+  message: string;
+};
+
+export type OcrHealth = {
+  enabled: boolean;
+  ok: boolean;
+  engine: string;
   message: string;
 };
 
@@ -126,6 +135,55 @@ export type JobListResponse = {
   total: number;
   limit: number;
   offset: number;
+};
+
+export type TagItem = {
+  id: number;
+  project_id: number;
+  name: string;
+  created_at: string;
+};
+
+export type ChatMessageItem = {
+  id: number;
+  project_id: number;
+  role: string;
+  content: string;
+  created_at: string;
+};
+
+export type ParagraphDetail = {
+  id: number;
+  order_index: number;
+  text: string;
+  summary: string;
+  chunk_count: number;
+};
+
+export type SectionDetail = {
+  id: number;
+  order_index: number;
+  title: string;
+  level: number;
+  summary: string;
+  paragraphs: ParagraphDetail[];
+};
+
+export type DocumentDetailResponse = {
+  document: DocumentItem;
+  sections: SectionDetail[];
+  section_count: number;
+  paragraph_count: number;
+  chunk_count: number;
+};
+
+export type SearchKnowledgeOptions = {
+  top_k?: number;
+  tagIds?: number[];
+  fileTypes?: string[];
+  createdAfter?: string;
+  createdBefore?: string;
+  ragUseChatHistory?: boolean;
 };
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -263,11 +321,22 @@ export function searchKnowledge(
   query: string,
   mode: 'search' | 'rag',
   projectId: number,
+  opts?: SearchKnowledgeOptions,
 ): Promise<SearchResponse> {
   return request<SearchResponse>('/api/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project_id: projectId, query, mode, top_k: 8 }),
+    body: JSON.stringify({
+      project_id: projectId,
+      query,
+      mode,
+      top_k: opts?.top_k ?? 8,
+      tag_ids: opts?.tagIds ?? [],
+      file_types: opts?.fileTypes ?? [],
+      created_after: opts?.createdAfter ?? null,
+      created_before: opts?.createdBefore ?? null,
+      rag_use_chat_history: opts?.ragUseChatHistory ?? true,
+    }),
   });
 }
 
@@ -279,6 +348,10 @@ export function getEmbeddingHealth(): Promise<EmbeddingHealth> {
   return request<EmbeddingHealth>('/api/embedding/health');
 }
 
+export function getOcrHealth(): Promise<OcrHealth> {
+  return request<OcrHealth>('/api/ocr/health');
+}
+
 export function reindexProject(projectId: number): Promise<ReindexResult> {
   return request<ReindexResult>(`/api/projects/${projectId}/reindex`, {
     method: 'POST',
@@ -287,4 +360,53 @@ export function reindexProject(projectId: number): Promise<ReindexResult> {
 
 export function getProjectIndexStats(projectId: number): Promise<ProjectIndexStats> {
   return request<ProjectIndexStats>(`/api/projects/${projectId}/index-stats`);
+}
+
+export function listTags(projectId: number): Promise<TagItem[]> {
+  return request<TagItem[]>(`/api/projects/${projectId}/tags`);
+}
+
+export function createTag(projectId: number, name: string): Promise<TagItem> {
+  return request<TagItem>(`/api/projects/${projectId}/tags`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function deleteTag(projectId: number, tagId: number): Promise<{ deleted: boolean }> {
+  return request<{ deleted: boolean }>(`/api/projects/${projectId}/tags/${tagId}`, {
+    method: 'DELETE',
+  });
+}
+
+export function patchDocumentTags(
+  documentId: number,
+  projectId: number,
+  tagIds: number[],
+): Promise<DocumentItem> {
+  return request<DocumentItem>(`/api/documents/${documentId}/tags?project_id=${projectId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tag_ids: tagIds }),
+  });
+}
+
+export function getDocumentDetail(
+  documentId: number,
+  projectId: number,
+): Promise<DocumentDetailResponse> {
+  return request<DocumentDetailResponse>(
+    `/api/documents/${documentId}/detail?project_id=${projectId}`,
+  );
+}
+
+export function listChatMessages(projectId: number, limit = 40): Promise<ChatMessageItem[]> {
+  return request<ChatMessageItem[]>(`/api/projects/${projectId}/chat?limit=${limit}`);
+}
+
+export function clearChatMessages(projectId: number): Promise<{ cleared: boolean }> {
+  return request<{ cleared: boolean }>(`/api/projects/${projectId}/chat`, {
+    method: 'DELETE',
+  });
 }

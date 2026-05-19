@@ -30,7 +30,15 @@ class RetrievalService:
         self.embedding = EmbeddingService()
         self.settings = get_settings()
 
-    def search(self, query: str, project_id: int, top_k: int = 8) -> list[SearchHit]:
+    def search(
+        self,
+        query: str,
+        project_id: int,
+        top_k: int = 8,
+        doc_filter: set[int] | None = None,
+    ) -> list[SearchHit]:
+        if doc_filter is not None and len(doc_filter) == 0:
+            return []
         query_vector = self.embedding.embed(query)
         tokens = _query_tokens(query)
 
@@ -105,6 +113,8 @@ class RetrievalService:
                     bm25_norm,
                 )
                 if candidate:
+                    if doc_filter is not None and candidate.document_id not in doc_filter:
+                        continue
                     candidates.append(candidate)
 
         deduped = self._dedupe(candidates)

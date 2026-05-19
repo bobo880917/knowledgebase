@@ -8,7 +8,15 @@ from fastapi import UploadFile
 from collections.abc import Callable
 
 from app.core.config import get_settings
-from app.schemas import DocumentOut, ProjectIndexStats, ReindexResult, UploadResult
+from app.schemas import (
+    DocumentDetailOut,
+    DocumentOut,
+    ParagraphDetailOut,
+    ProjectIndexStats,
+    ReindexResult,
+    SectionDetailOut,
+    UploadResult,
+)
 from app.services.embeddings import EmbeddingService
 from app.services.fts_index import delete_document_rows, delete_project_rows, insert_entity_row
 from app.services.parsers import SUPPORTED_EXTENSIONS, parse_document
@@ -74,8 +82,9 @@ class DocumentIndexer:
                 existing = self._fetch_duplicate_document_row(conn, project_id, fingerprint)
                 if existing:
                     doc_id = int(existing["id"])
+                    tag_names = self._document_tag_names(conn, doc_id)
                     return UploadResult(
-                        document=DocumentOut(**dict(existing)),
+                        document=DocumentOut(**{**dict(existing), "tags": tag_names}),
                         section_count=self._count(conn, "sections", doc_id),
                         paragraph_count=self._count(conn, "paragraphs", doc_id),
                         chunk_count=self._count(conn, "chunks", doc_id),
@@ -95,7 +104,20 @@ class DocumentIndexer:
             self._update_job_progress(job_id, "解析文档结构…", None, None)
         elif progress_cb:
             progress_cb("解析文档结构…", None, None)
-        sections = parse_document(target)
+
+        def _ocr_progress(msg: str) -> None:
+            if job_id:
+                self._update_job_progress(job_id, msg, None, None)
+            elif progress_cb:
+                progress_cb(msg, None, None)
+
+        parse_out = parse_document(
+            target,
+            raw_content_hash=raw_content_hash,
+            progress_note=_ocr_progress if (job_id or progress_cb) else None,
+        )
+        sections = parse_out.sections
+        ocr_meta_json = parse_out.ocr_meta or ""
 
         if should_cancel and should_cancel():
             raise CancelledError("cancel_requested")
@@ -118,8 +140,8 @@ class DocumentIndexer:
         with get_db() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO documents(project_id, filename, file_type, source_path, content_hash, content_fingerprint, summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO documents(project_id, filename, file_type, source_path, content_hash, content_fingerprint, summary, ocr_meta)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -129,6 +151,7 @@ class DocumentIndexer:
                     content_hash,
                     fingerprint,
                     document_summary,
+                    ocr_meta_json,
                 ),
             )
             document_id = int(cursor.lastrowid)
@@ -236,14 +259,15 @@ class DocumentIndexer:
 
             row = conn.execute(
                 """
-                SELECT id, project_id, filename, file_type, summary, created_at
+                SELECT id, project_id, filename, file_type, summary, created_at, ocr_meta
                 FROM documents
                 WHERE id = ?
                 """,
                 (document_id,),
             ).fetchone()
+            tag_names = self._document_tag_names(conn, document_id)
             return UploadResult(
-                document=DocumentOut(**dict(row)),
+                document=DocumentOut(**{**dict(row), "tags": tag_names}),
                 section_count=section_count,
                 paragraph_count=paragraph_count,
                 chunk_count=chunk_count,
@@ -258,7 +282,7 @@ class DocumentIndexer:
     def _fetch_duplicate_document_row(conn, project_id: int, fingerprint: str):
         return conn.execute(
             """
-            SELECT id, project_id, filename, file_type, summary, created_at
+            SELECT id, project_id, filename, file_type, summary, created_at, ocr_meta
             FROM documents
             WHERE project_id = ?
               AND (
@@ -291,14 +315,130 @@ class DocumentIndexer:
         with get_db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, project_id, filename, file_type, summary, created_at
-                FROM documents
-                WHERE project_id = ?
-                ORDER BY created_at DESC
+                SELECT
+                    d.id,
+                    d.project_id,
+                    d.filename,
+                    d.file_type,
+                    d.summary,
+                    d.created_at,
+                    d.ocr_meta,
+                    COALESCE(
+                        (
+                            SELECT group_concat(t.name, '|')
+                            FROM document_tags dt
+                            JOIN tags t ON t.id = dt.tag_id
+                            WHERE dt.document_id = d.id
+                        ),
+                        ''
+                    ) AS tags_joined
+                FROM documents d
+                WHERE d.project_id = ?
+                ORDER BY d.created_at DESC
                 """,
                 (project_id,),
             ).fetchall()
-        return [DocumentOut(**dict(row)) for row in rows]
+        out: list[DocumentOut] = []
+        for row in rows:
+            data = dict(row)
+            tj = (data.pop("tags_joined", None) or "").strip()
+            tags = [x for x in tj.split("|") if x] if tj else []
+            data["tags"] = tags
+            out.append(DocumentOut(**data))
+        return out
+
+    def get_document_detail(self, document_id: int, project_id: int) -> DocumentDetailOut | None:
+        with get_db() as conn:
+            doc = conn.execute(
+                """
+                SELECT id, project_id, filename, file_type, summary, created_at, ocr_meta
+                FROM documents
+                WHERE id = ? AND project_id = ?
+                """,
+                (document_id, project_id),
+            ).fetchone()
+            if not doc:
+                return None
+            tags = self._document_tag_names(conn, document_id)
+            document_out = DocumentOut(**{**dict(doc), "tags": tags})
+
+            sec_rows = conn.execute(
+                """
+                SELECT id, title, level, summary, order_index
+                FROM sections
+                WHERE document_id = ?
+                ORDER BY order_index
+                """,
+                (document_id,),
+            ).fetchall()
+
+            sections_out: list[SectionDetailOut] = []
+            total_paras = 0
+            total_chunks = 0
+            for sec in sec_rows:
+                sid = int(sec["id"])
+                p_rows = conn.execute(
+                    """
+                    SELECT p.id, p.order_index, p.text, p.summary,
+                           (SELECT COUNT(*) FROM chunks c WHERE c.paragraph_id = p.id) AS chunk_count
+                    FROM paragraphs p
+                    WHERE p.section_id = ?
+                    ORDER BY p.order_index
+                    """,
+                    (sid,),
+                ).fetchall()
+                paras: list[ParagraphDetailOut] = []
+                for pr in p_rows:
+                    cct = int(pr["chunk_count"] or 0)
+                    total_chunks += cct
+                    paras.append(
+                        ParagraphDetailOut(
+                            id=int(pr["id"]),
+                            order_index=int(pr["order_index"]),
+                            text=str(pr["text"]),
+                            summary=str(pr["summary"]),
+                            chunk_count=cct,
+                        )
+                    )
+                    total_paras += 1
+                sections_out.append(
+                    SectionDetailOut(
+                        id=sid,
+                        order_index=int(sec["order_index"]),
+                        title=str(sec["title"]),
+                        level=int(sec["level"]),
+                        summary=str(sec["summary"]),
+                        paragraphs=paras,
+                    )
+                )
+
+            ctot = conn.execute(
+                "SELECT COUNT(*) AS c FROM chunks WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+            chunk_total = int(ctot["c"]) if ctot else 0
+
+        return DocumentDetailOut(
+            document=document_out,
+            sections=sections_out,
+            section_count=len(sections_out),
+            paragraph_count=total_paras,
+            chunk_count=chunk_total,
+        )
+
+    @staticmethod
+    def _document_tag_names(conn, document_id: int) -> list[str]:
+        rows = conn.execute(
+            """
+            SELECT t.name
+            FROM tags t
+            JOIN document_tags dt ON dt.tag_id = t.id
+            WHERE dt.document_id = ?
+            ORDER BY t.name COLLATE NOCASE
+            """,
+            (document_id,),
+        ).fetchall()
+        return [str(r["name"]) for r in rows]
 
     def delete_document(self, document_id: int, project_id: int) -> bool:
         with get_db() as conn:
@@ -309,9 +449,18 @@ class DocumentIndexer:
             if not row:
                 return False
             delete_document_rows(conn, document_id)
-            conn.execute("DELETE FROM embeddings WHERE entity_id IN (SELECT id FROM sections WHERE document_id = ?) AND entity_type = 'section'", (document_id,))
-            conn.execute("DELETE FROM embeddings WHERE entity_id IN (SELECT id FROM paragraphs WHERE document_id = ?) AND entity_type = 'paragraph'", (document_id,))
-            conn.execute("DELETE FROM embeddings WHERE entity_id IN (SELECT id FROM chunks WHERE document_id = ?) AND entity_type = 'chunk'", (document_id,))
+            conn.execute(
+                "DELETE FROM embeddings WHERE entity_id IN (SELECT id FROM sections WHERE document_id = ?) AND entity_type = 'section'",
+                (document_id,),
+            )
+            conn.execute(
+                "DELETE FROM embeddings WHERE entity_id IN (SELECT id FROM paragraphs WHERE document_id = ?) AND entity_type = 'paragraph'",
+                (document_id,),
+            )
+            conn.execute(
+                "DELETE FROM embeddings WHERE entity_id IN (SELECT id FROM chunks WHERE document_id = ?) AND entity_type = 'chunk'",
+                (document_id,),
+            )
             conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
         source = Path(row["source_path"])
         if source.exists():

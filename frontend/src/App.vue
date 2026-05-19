@@ -1,36 +1,65 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
   cancelJob,
+  clearChatMessages,
   createProject,
   createImportJob,
   createImportUrlJob,
   createReindexJob,
+  createTag,
   deleteDocument,
   deleteProject,
+  deleteTag,
+  getDocumentDetail,
   getEmbeddingHealth,
+  getOcrHealth,
   getJob,
   getProjectIndexStats,
   getProviderHealth,
+  listChatMessages,
   listJobs,
   listDocuments,
   listProjects,
+  listTags,
+  patchDocumentTags,
   searchKnowledge,
   retryJob,
   updateProject,
+  type ChatMessageItem,
+  type DocumentDetailResponse,
   type DocumentItem,
   type EmbeddingHealth,
   type JobItem,
+  type OcrHealth,
   type ProjectIndexStats,
   type ProjectItem,
   type ProviderHealth,
   type ReindexResult,
+  type SearchHit,
   type SearchResponse,
+  type TagItem,
   type UploadDedupMode,
   type UploadResult,
 } from './services/api';
 
-type ViewKey = 'projects' | 'documents' | 'search' | 'jobs';
+type ViewKey = 'projects' | 'documents' | 'search' | 'jobs' | 'document';
+
+const FILE_TYPE_FILTERS = [
+  'md',
+  'txt',
+  'docx',
+  'pdf',
+  'html',
+  'xlsx',
+  'pptx',
+  'png',
+  'jpg',
+  'jpeg',
+  'webp',
+  'tif',
+  'tiff',
+] as const;
 
 const projects = ref<ProjectItem[]>([]);
 const activeProjectId = ref(1);
@@ -47,6 +76,7 @@ const selectedJobId = ref<number | null>(null);
 let selectedJobTimer: number | null = null;
 const provider = ref<ProviderHealth | null>(null);
 const embedding = ref<EmbeddingHealth | null>(null);
+const ocrHealth = ref<OcrHealth | null>(null);
 const indexStats = ref<ProjectIndexStats | null>(null);
 const selectedFile = ref<File | null>(null);
 const importDedupMode = ref<UploadDedupMode>('ignore');
@@ -71,7 +101,22 @@ const deletingDocumentId = ref<number | null>(null);
 const reindexing = ref(false);
 const error = ref('');
 
-const menuItems: Array<{ key: ViewKey; label: string; description: string }> = [
+const projectTags = ref<TagItem[]>([]);
+const newTagName = ref('');
+const docTagPickerDocId = ref<number | null>(null);
+const selectedTagIdsForPicker = ref<number[]>([]);
+const searchFilterTagIds = ref<number[]>([]);
+const searchFilterFileTypes = ref<string[]>([]);
+const searchDateAfter = ref('');
+const searchDateBefore = ref('');
+const ragUseChatHistory = ref(true);
+const chatMessages = ref<ChatMessageItem[]>([]);
+
+const documentDetailId = ref<number | null>(null);
+const documentDetail = ref<DocumentDetailResponse | null>(null);
+const hitHighlight = ref<{ match_type: string; source_id: number } | null>(null);
+
+const menuItems: Array<{ key: Exclude<ViewKey, 'document'>; label: string; description: string }> = [
   { key: 'search', label: '检索问答', description: '搜索、RAG 与来源调试' },
   { key: 'documents', label: '文档管理', description: '上传、查看和删除文档' },
   { key: 'jobs', label: '任务中心', description: '导入/重建的进度与历史' },
@@ -82,9 +127,12 @@ const activeProject = computed(() =>
   projects.value.find((project) => project.id === activeProjectId.value) ?? null,
 );
 
-const activeViewTitle = computed(
-  () => menuItems.find((item) => item.key === currentView.value)?.label ?? '知识库',
-);
+const activeViewTitle = computed(() => {
+  if (currentView.value === 'document') {
+    return documentDetail.value?.document.filename ?? '文档详情';
+  }
+  return menuItems.find((item) => item.key === currentView.value)?.label ?? '知识库';
+});
 
 const stats = computed(() => ({
   project: activeProject.value?.name ?? '默认项目',
@@ -106,13 +154,21 @@ function onFileChange(event: Event) {
   selectedFile.value = input.files?.[0] ?? null;
 }
 
-function goTo(view: ViewKey) {
+function goTo(view: Exclude<ViewKey, 'document'>) {
   currentView.value = view;
 }
 
 async function onProjectSelect(event: Event) {
   const select = event.target as HTMLSelectElement;
   await switchProject(Number(select.value));
+}
+
+async function loadProjectTags() {
+  try {
+    projectTags.value = await listTags(activeProjectId.value);
+  } catch {
+    projectTags.value = [];
+  }
 }
 
 async function refresh() {
@@ -124,6 +180,12 @@ async function refresh() {
   indexStats.value = await getProjectIndexStats(activeProjectId.value);
   provider.value = await getProviderHealth();
   embedding.value = await getEmbeddingHealth();
+  try {
+    ocrHealth.value = await getOcrHealth();
+  } catch {
+    ocrHealth.value = null;
+  }
+  await loadProjectTags();
 }
 
 async function refreshJobs() {
@@ -157,8 +219,15 @@ async function switchProject(projectId: number) {
   editingProject.value = false;
   jobsPage.value = 1;
   selectedJobId.value = null;
+  documentDetailId.value = null;
+  documentDetail.value = null;
+  hitHighlight.value = null;
+  if (currentView.value === 'document') {
+    currentView.value = 'search';
+  }
   documents.value = await listDocuments(projectId);
   indexStats.value = await getProjectIndexStats(projectId);
+  await loadProjectTags();
   if (currentView.value === 'jobs') {
     await refreshJobs();
   }
@@ -466,11 +535,154 @@ async function submitSearch() {
   loading.value = true;
   error.value = '';
   try {
-    result.value = await searchKnowledge(query.value.trim(), mode.value, activeProjectId.value);
+    result.value = await searchKnowledge(query.value.trim(), mode.value, activeProjectId.value, {
+      tagIds: searchFilterTagIds.value,
+      fileTypes: searchFilterFileTypes.value,
+      createdAfter: searchDateAfter.value || undefined,
+      createdBefore: searchDateBefore.value || undefined,
+      ragUseChatHistory: ragUseChatHistory.value,
+    });
+    if (mode.value === 'rag') {
+      await loadChatHistory();
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : '检索失败';
   } finally {
     loading.value = false;
+  }
+}
+
+async function loadChatHistory() {
+  try {
+    chatMessages.value = await listChatMessages(activeProjectId.value, 50);
+  } catch {
+    chatMessages.value = [];
+  }
+}
+
+async function clearChat() {
+  error.value = '';
+  try {
+    await clearChatMessages(activeProjectId.value);
+    chatMessages.value = [];
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '清空失败';
+  }
+}
+
+function toggleSearchTag(tagId: number) {
+  const i = searchFilterTagIds.value.indexOf(tagId);
+  if (i >= 0) {
+    searchFilterTagIds.value.splice(i, 1);
+  } else {
+    searchFilterTagIds.value.push(tagId);
+  }
+}
+
+function toggleSearchFileType(ft: string) {
+  const i = searchFilterFileTypes.value.indexOf(ft);
+  if (i >= 0) {
+    searchFilterFileTypes.value.splice(i, 1);
+  } else {
+    searchFilterFileTypes.value.push(ft);
+  }
+}
+
+async function submitNewTag() {
+  if (!newTagName.value.trim()) return;
+  error.value = '';
+  try {
+    await createTag(activeProjectId.value, newTagName.value.trim());
+    newTagName.value = '';
+    await loadProjectTags();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '创建标签失败';
+  }
+}
+
+async function removeTag(tag: TagItem) {
+  if (!window.confirm(`删除标签「${tag.name}」？文档上的该标签关联会一并移除。`)) return;
+  error.value = '';
+  try {
+    await deleteTag(activeProjectId.value, tag.id);
+    await loadProjectTags();
+    searchFilterTagIds.value = searchFilterTagIds.value.filter((id) => id !== tag.id);
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '删除标签失败';
+  }
+}
+
+function openTagPicker(doc: DocumentItem) {
+  docTagPickerDocId.value = doc.id;
+  const names = new Set(doc.tags || []);
+  selectedTagIdsForPicker.value = projectTags.value.filter((t) => names.has(t.name)).map((t) => t.id);
+}
+
+function onPickerCheckboxChange(tagId: number, event: Event) {
+  const el = event.target as HTMLInputElement;
+  const i = selectedTagIdsForPicker.value.indexOf(tagId);
+  if (el.checked && i < 0) {
+    selectedTagIdsForPicker.value.push(tagId);
+  }
+  if (!el.checked && i >= 0) {
+    selectedTagIdsForPicker.value.splice(i, 1);
+  }
+}
+
+async function saveTagPicker() {
+  if (docTagPickerDocId.value == null) return;
+  error.value = '';
+  try {
+    await patchDocumentTags(docTagPickerDocId.value, activeProjectId.value, [...selectedTagIdsForPicker.value]);
+    docTagPickerDocId.value = null;
+    await refresh();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '保存标签失败';
+  }
+}
+
+function formatOcrMeta(raw: string | undefined | null): string {
+  const s = raw?.trim();
+  if (!s) return '';
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2);
+  } catch {
+    return s;
+  }
+}
+
+function openDocumentDetail(docId: number, highlight?: { match_type: string; source_id: number }) {
+  documentDetailId.value = docId;
+  hitHighlight.value = highlight ?? null;
+  currentView.value = 'document';
+  loadDocumentDetailPage().catch((err) => {
+    error.value = err instanceof Error ? err.message : '加载文档失败';
+  });
+}
+
+async function loadDocumentDetailPage() {
+  if (documentDetailId.value == null) return;
+  documentDetail.value = await getDocumentDetail(documentDetailId.value, activeProjectId.value);
+  await nextTick();
+  const h = hitHighlight.value;
+  if (h) {
+    const el = document.getElementById(`hl-${h.match_type}-${h.source_id}`);
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+function backFromDocument() {
+  documentDetailId.value = null;
+  documentDetail.value = null;
+  hitHighlight.value = null;
+  currentView.value = 'documents';
+}
+
+function openHitInDocument(hit: SearchHit) {
+  if (hit.match_type === 'chunk') {
+    openDocumentDetail(hit.document_id);
+  } else {
+    openDocumentDetail(hit.document_id, { match_type: hit.match_type, source_id: hit.source_id });
   }
 }
 
@@ -487,6 +699,18 @@ watch(
       refreshJobs().catch(() => undefined);
     } else {
       stopSelectedJobAutoRefresh();
+    }
+    if (view === 'search' && mode.value === 'rag') {
+      loadChatHistory().catch(() => undefined);
+    }
+  },
+);
+
+watch(
+  () => mode.value,
+  (m) => {
+    if (m === 'rag' && currentView.value === 'search') {
+      loadChatHistory().catch(() => undefined);
     }
   },
 );
@@ -684,6 +908,24 @@ onBeforeUnmount(() => {
             <p>{{ embedding?.message || '正在读取 embedding 状态...' }}</p>
           </div>
 
+          <div
+            v-if="ocrHealth"
+            class="embedding-status"
+            :class="{ warning: ocrHealth.enabled && !ocrHealth.ok }"
+          >
+            <strong>{{
+              !ocrHealth.enabled
+                ? 'OCR 未启用'
+                : ocrHealth.ok
+                  ? 'OCR 就绪'
+                  : 'OCR 不可用'
+            }}</strong>
+            <p>{{ ocrHealth.message }}</p>
+            <p v-if="ocrHealth.enabled && ocrHealth.engine" class="muted" style="margin: 0">
+              引擎：{{ ocrHealth.engine }}
+            </p>
+          </div>
+
           <div v-if="indexStats" class="index-stats-card" :class="{ warning: !indexStats.indexed }">
             <strong>{{ indexStats.indexed ? '当前项目索引完整' : '当前项目索引需要重建' }}</strong>
             <p class="muted" style="margin: 0">
@@ -730,7 +972,8 @@ onBeforeUnmount(() => {
             <div>
               <h2>导入文档</h2>
               <p class="muted">
-                当前项目：{{ activeProject?.name }}。支持 md、txt、docx、pdf、html、xlsx、pptx；亦可填写 URL 抓取网页正文。
+                当前项目：{{ activeProject?.name }}。支持 md、txt、docx、pdf、html、xlsx、pptx、常见图片（png/jpg/webp 等，需后端启用
+                OCR）；亦可填写 URL 抓取网页正文。
               </p>
             </div>
           </div>
@@ -738,7 +981,7 @@ onBeforeUnmount(() => {
           <label class="dropzone">
             <input
               type="file"
-              accept=".md,.txt,.docx,.pdf,.html,.htm,.xlsx,.pptx"
+              accept=".md,.txt,.docx,.pdf,.html,.htm,.xlsx,.pptx,.png,.jpg,.jpeg,.webp,.tif,.tiff"
               @change="onFileChange"
             />
             <span>{{ selectedFile?.name || '选择一个知识文件' }}</span>
@@ -788,22 +1031,65 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <div class="tag-admin-row">
+            <span class="muted">项目标签</span>
+            <div class="tag-chips">
+              <span v-for="t in projectTags" :key="t.id" class="tag-chip">
+                {{ t.name }}
+                <button type="button" class="tag-chip-x" @click="removeTag(t)">×</button>
+              </span>
+            </div>
+            <input v-model="newTagName" class="tag-name-input" placeholder="新标签名" @keyup.enter="submitNewTag" />
+            <button type="button" class="ghost-button small-button" :disabled="!newTagName.trim()" @click="submitNewTag">
+              添加
+            </button>
+          </div>
+
           <div class="document-grid">
             <article v-for="doc in documents" :key="doc.id" class="document-item">
               <div class="document-head">
                 <strong>{{ doc.filename }}</strong>
-                <button
-                  class="danger-button small-button"
-                  :disabled="deletingDocumentId === doc.id"
-                  @click="removeDocument(doc)"
-                >
-                  {{ deletingDocumentId === doc.id ? '删除中' : '删除' }}
-                </button>
+                <div class="document-head-actions">
+                  <button type="button" class="ghost-button small-button" @click="openDocumentDetail(doc.id)">详情</button>
+                  <button type="button" class="ghost-button small-button" @click="openTagPicker(doc)">标签</button>
+                  <button
+                    class="danger-button small-button"
+                    :disabled="deletingDocumentId === doc.id"
+                    @click="removeDocument(doc)"
+                  >
+                    {{ deletingDocumentId === doc.id ? '删除中' : '删除' }}
+                  </button>
+                </div>
               </div>
               <span>{{ doc.file_type }} · {{ doc.created_at }}</span>
+              <p v-if="doc.tags?.length" class="doc-tag-line">
+                <span v-for="name in doc.tags" :key="name" class="tag-pill">{{ name }}</span>
+              </p>
               <p>{{ doc.summary || '暂无简介' }}</p>
             </article>
             <p v-if="!documents.length" class="empty-state">当前项目还没有文档，先上传一份资料建立索引。</p>
+          </div>
+
+          <div v-if="docTagPickerDocId != null" class="tag-picker-overlay" @click.self="docTagPickerDocId = null">
+            <div class="tag-picker-modal panel">
+              <h3>编辑文档标签</h3>
+              <p class="muted">勾选后点击保存</p>
+              <div class="tag-picker-list">
+                <label v-for="t in projectTags" :key="t.id" class="tag-picker-item">
+                  <input
+                    type="checkbox"
+                    :checked="selectedTagIdsForPicker.includes(t.id)"
+                    @change="onPickerCheckboxChange(t.id, $event)"
+                  />
+                  {{ t.name }}
+                </label>
+                <p v-if="!projectTags.length" class="muted">暂无标签，请先在上方添加。</p>
+              </div>
+              <div class="action-row">
+                <button type="button" class="ghost-button" @click="docTagPickerDocId = null">取消</button>
+                <button type="button" @click="saveTagPicker">保存</button>
+              </div>
+            </div>
           </div>
         </article>
       </section>
@@ -913,7 +1199,54 @@ onBeforeUnmount(() => {
         </article>
       </section>
 
-      <section v-else class="search-layout">
+      <section v-else-if="currentView === 'document'" class="page-grid document-detail-page">
+        <article v-if="documentDetail" class="panel page-card document-detail-card">
+          <div class="section-heading">
+            <div>
+              <button type="button" class="ghost-button small-button" @click="backFromDocument">← 返回文档列表</button>
+              <h2>{{ documentDetail.document.filename }}</h2>
+              <p class="muted">
+                {{ documentDetail.document.file_type }} · {{ documentDetail.document.created_at }} ·
+                章节 {{ documentDetail.section_count }} · 段落 {{ documentDetail.paragraph_count }} · 切片
+                {{ documentDetail.chunk_count }}
+              </p>
+              <p v-if="documentDetail.document.tags?.length" class="doc-tag-line">
+                <span v-for="name in documentDetail.document.tags" :key="name" class="tag-pill">{{ name }}</span>
+              </p>
+            </div>
+          </div>
+          <div class="detail-summary">{{ documentDetail.document.summary || '暂无简介' }}</div>
+          <details v-if="formatOcrMeta(documentDetail.document.ocr_meta)" class="debug-panel ocr-meta-panel">
+            <summary>OCR / 解析元信息（可回溯）</summary>
+            <pre class="ocr-meta-pre">{{ formatOcrMeta(documentDetail.document.ocr_meta) }}</pre>
+          </details>
+          <div class="section-tree">
+            <section
+              v-for="sec in documentDetail.sections"
+              :key="sec.id"
+              class="detail-section-block"
+              :id="'hl-section-' + sec.id"
+              :class="{ 'hl-active': hitHighlight?.match_type === 'section' && hitHighlight?.source_id === sec.id }"
+            >
+              <h3 class="detail-section-title">{{ sec.title }}</h3>
+              <p v-if="sec.summary" class="muted small-summary">{{ sec.summary }}</p>
+              <div
+                v-for="p in sec.paragraphs"
+                :key="p.id"
+                class="detail-paragraph"
+                :id="'hl-paragraph-' + p.id"
+                :class="{ 'hl-active': hitHighlight?.match_type === 'paragraph' && hitHighlight?.source_id === p.id }"
+              >
+                <span class="para-meta">段落 {{ p.order_index + 1 }} · 切片 {{ p.chunk_count }}</span>
+                <p class="para-text">{{ p.text }}</p>
+              </div>
+            </section>
+          </div>
+        </article>
+        <p v-else class="muted panel page-card">加载中…</p>
+      </section>
+
+      <section v-else-if="currentView === 'search'" class="search-layout">
         <article class="panel page-card search-page-card">
           <div class="search-header">
             <div>
@@ -931,12 +1264,72 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <div class="search-filters panel-inset">
+            <p class="muted filter-title">检索范围（可组合）</p>
+            <div class="filter-row">
+              <span class="filter-label">标签</span>
+              <div class="filter-tags">
+                <button
+                  v-for="t in projectTags"
+                  :key="t.id"
+                  type="button"
+                  class="filter-tag-btn"
+                  :class="{ on: searchFilterTagIds.includes(t.id) }"
+                  @click="toggleSearchTag(t.id)"
+                >
+                  {{ t.name }}
+                </button>
+                <span v-if="!projectTags.length" class="muted">暂无标签，可在「文档管理」添加</span>
+              </div>
+            </div>
+            <div class="filter-row">
+              <span class="filter-label">类型</span>
+              <div class="filter-tags">
+                <button
+                  v-for="ft in FILE_TYPE_FILTERS"
+                  :key="ft"
+                  type="button"
+                  class="filter-tag-btn"
+                  :class="{ on: searchFilterFileTypes.includes(ft) }"
+                  @click="toggleSearchFileType(ft)"
+                >
+                  {{ ft }}
+                </button>
+              </div>
+            </div>
+            <div class="filter-row filter-dates">
+              <label>创建于 <input v-model="searchDateAfter" type="date" class="date-input" /></label>
+              <label>止于 <input v-model="searchDateBefore" type="date" class="date-input" /></label>
+            </div>
+            <label v-if="mode === 'rag'" class="filter-check">
+              <input v-model="ragUseChatHistory" type="checkbox" />
+              RAG 携带近期对话（多轮追问）
+            </label>
+          </div>
+
           <form class="query-box" @submit.prevent="submitSearch">
             <textarea v-model="query" placeholder="例如：项目里关于本地模型 API 的设计是什么？" />
             <button :disabled="loading || !query.trim()">
               {{ loading ? '检索中...' : '开始检索' }}
             </button>
           </form>
+
+          <div v-if="mode === 'rag'" class="chat-panel panel-inset">
+            <div class="section-heading">
+              <div>
+                <h3>当前项目对话</h3>
+                <p class="muted">RAG 每次提问会写入此处；切换项目后各项目独立。</p>
+              </div>
+              <button type="button" class="ghost-button small-button" @click="clearChat">清空</button>
+            </div>
+            <div class="chat-scroll">
+              <div v-for="m in chatMessages" :key="m.id" class="chat-line" :class="'role-' + m.role">
+                <span class="chat-role">{{ m.role === 'user' ? '你' : m.role === 'assistant' ? '答' : '系' }}</span>
+                <p>{{ m.content }}</p>
+              </div>
+              <p v-if="!chatMessages.length" class="muted empty-chat">尚无记录，发起一次 RAG 问答后会显示在这里。</p>
+            </div>
+          </div>
         </article>
 
         <article v-if="result?.answer" class="answer-card panel">
@@ -972,6 +1365,9 @@ onBeforeUnmount(() => {
             <p v-if="hit.section_title" class="section-title">{{ hit.section_title }}</p>
             <p v-if="hit.location_label" class="muted location-label">{{ hit.location_label }}</p>
             <p>{{ hit.text }}</p>
+            <div class="hit-actions">
+              <button type="button" class="ghost-button small-button" @click="openHitInDocument(hit)">在文档中打开</button>
+            </div>
             <details class="debug-panel">
               <summary>查看检索调试信息</summary>
               <div class="score-grid">

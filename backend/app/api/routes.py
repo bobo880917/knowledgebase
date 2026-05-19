@@ -6,8 +6,14 @@ import json
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
 from app.schemas import (
+    ChatAppend,
+    ChatMessageOut,
     CreateJobResponse,
+    DocumentDetailOut,
+    DocumentOut,
+    DocumentTagsPatch,
     EmbeddingHealth,
+    OcrHealth,
     ProjectCreate,
     ProjectIndexStats,
     ProjectOut,
@@ -20,15 +26,21 @@ from app.schemas import (
     SearchResponse,
     SourceSummary,
     ReindexResult,
+    TagCreate,
+    TagOut,
     UploadResult,
 )
 from app.core.config import get_settings
+from app.services import chat as chat_service
+from app.services import tags as tags_service
 from app.services.embeddings import EmbeddingService
 from app.services.indexer import DocumentIndexer
 from app.services.jobs import job_service
 from app.services.llm_provider import LLMProvider
+from app.services.ocr_engine import ocr_health
 from app.services.projects import ProjectService
 from app.services.retrieval import RetrievalService
+from app.storage.database import get_db
 
 router = APIRouter(prefix="/api")
 indexer = DocumentIndexer()
@@ -51,6 +63,12 @@ async def provider_health() -> ProviderHealth:
 @router.get("/embedding/health", response_model=EmbeddingHealth)
 def embedding_health() -> EmbeddingHealth:
     return embedding_service.health()
+
+
+@router.get("/ocr/health", response_model=OcrHealth)
+def ocr_health_endpoint() -> OcrHealth:
+    data = ocr_health()
+    return OcrHealth(**data)
 
 
 @router.get("/projects", response_model=list[ProjectOut])
@@ -197,6 +215,112 @@ def retry_job(job_id: int) -> CreateJobResponse:
     return CreateJobResponse(job_id=new_job_id)
 
 
+@router.get("/projects/{project_id}/tags", response_model=list[TagOut])
+def list_project_tags(project_id: int) -> list[TagOut]:
+    _ensure_project(project_id)
+    with get_db() as conn:
+        rows = tags_service.list_tags(conn, project_id)
+    return [TagOut(**dict(row)) for row in rows]
+
+
+@router.post("/projects/{project_id}/tags", response_model=TagOut)
+def create_project_tag(project_id: int, body: TagCreate) -> TagOut:
+    _ensure_project(project_id)
+    try:
+        with get_db() as conn:
+            row = tags_service.create_tag(conn, project_id, body.name)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=400, detail="标签名已存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return TagOut(**dict(row))
+
+
+@router.delete("/projects/{project_id}/tags/{tag_id}")
+def delete_project_tag(project_id: int, tag_id: int) -> dict[str, bool]:
+    _ensure_project(project_id)
+    with get_db() as conn:
+        ok = tags_service.delete_tag(conn, tag_id, project_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="标签不存在")
+    return {"deleted": True}
+
+
+@router.get("/projects/{project_id}/chat", response_model=list[ChatMessageOut])
+def list_project_chat(project_id: int, limit: int = Query(default=40, ge=1, le=200)) -> list[ChatMessageOut]:
+    _ensure_project(project_id)
+    with get_db() as conn:
+        rows = chat_service.list_messages(conn, project_id, limit)
+    return [ChatMessageOut(**dict(row)) for row in rows]
+
+
+@router.post("/projects/{project_id}/chat", response_model=ChatMessageOut)
+def append_project_chat(project_id: int, body: ChatAppend) -> ChatMessageOut:
+    _ensure_project(project_id)
+    try:
+        with get_db() as conn:
+            chat_service.append_message(conn, project_id, body.role, body.content)
+            row = conn.execute(
+                """
+                SELECT id, project_id, role, content, created_at
+                FROM chat_messages
+                WHERE project_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    assert row
+    return ChatMessageOut(**dict(row))
+
+
+@router.delete("/projects/{project_id}/chat")
+def clear_project_chat(project_id: int) -> dict[str, bool]:
+    _ensure_project(project_id)
+    with get_db() as conn:
+        chat_service.clear_messages(conn, project_id)
+    return {"cleared": True}
+
+
+@router.patch("/documents/{document_id}/tags", response_model=DocumentOut)
+def patch_document_tags(
+    document_id: int,
+    project_id: int = Query(..., ge=1),
+    body: DocumentTagsPatch | None = None,
+) -> DocumentOut:
+    _ensure_project(project_id)
+    payload = body or DocumentTagsPatch()
+    try:
+        with get_db() as conn:
+            tags_service.set_document_tags(conn, document_id, project_id, payload.tag_ids)
+            row = conn.execute(
+                """
+                SELECT id, project_id, filename, file_type, summary, created_at, ocr_meta
+                FROM documents
+                WHERE id = ? AND project_id = ?
+                """,
+                (document_id, project_id),
+            ).fetchone()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not row:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    with get_db() as conn:
+        names = indexer._document_tag_names(conn, document_id)
+    return DocumentOut(**{**dict(row), "tags": names})
+
+
+@router.get("/documents/{document_id}/detail", response_model=DocumentDetailOut)
+def get_document_detail(document_id: int, project_id: int = Query(..., ge=1)) -> DocumentDetailOut:
+    _ensure_project(project_id)
+    detail = indexer.get_document_detail(document_id, project_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    return detail
+
+
 @router.get("/documents")
 def list_documents(project_id: int = Query(default=1, ge=1)):
     _ensure_project(project_id)
@@ -233,12 +357,33 @@ def delete_document(
 @router.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest) -> SearchResponse:
     _ensure_project(request.project_id)
-    hits = retrieval.search(request.query, request.project_id, request.top_k)
+    with get_db() as conn:
+        doc_filter = tags_service.document_ids_for_filters(
+            conn,
+            request.project_id,
+            tag_ids=request.tag_ids,
+            file_types=request.file_types,
+            created_after=request.created_after,
+            created_before=request.created_before,
+        )
+    hits = retrieval.search(
+        request.query,
+        request.project_id,
+        request.top_k,
+        doc_filter,
+    )
     sources = _build_sources(hits)
     answer = None
     rag_skipped_reason = None
     settings = get_settings()
     if request.mode == "rag":
+        conv = ""
+        if request.rag_use_chat_history:
+            with get_db() as conn:
+                rows = chat_service.list_messages(conn, request.project_id, 40)
+                conv = chat_service.tail_for_prompt(rows)
+        with get_db() as conn:
+            chat_service.append_message(conn, request.project_id, "user", request.query)
         min_score = float(settings.rag_min_evidence_score)
         if not hits:
             answer = "未在知识库中找到与问题相关的可靠片段，无法作答。请确认当前项目已导入相关文档或换个问法。"
@@ -251,9 +396,11 @@ async def search(request: SearchRequest) -> SearchResponse:
             rag_skipped_reason = "low_evidence_score"
         else:
             try:
-                answer = await llm_provider.answer(request.query, hits)
+                answer = await llm_provider.answer(request.query, hits, conv or None)
             except Exception as exc:
                 answer = f"已完成检索，但调用 LLM Provider 失败：{exc}"
+        with get_db() as conn:
+            chat_service.append_message(conn, request.project_id, "assistant", answer or "")
     return SearchResponse(
         query=request.query,
         mode=request.mode,

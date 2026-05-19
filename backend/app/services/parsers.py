@@ -1,29 +1,77 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
+from app.core.config import get_settings
 from app.services.text_utils import SectionDraft, build_sections_from_plain_text, normalize_text, split_paragraphs
 
+SUPPORTED_EXTENSIONS = {
+    ".md",
+    ".txt",
+    ".docx",
+    ".pdf",
+    ".html",
+    ".htm",
+    ".xlsx",
+    ".pptx",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".tif",
+    ".tiff",
+}
 
-SUPPORTED_EXTENSIONS = {".md", ".txt", ".docx", ".pdf", ".html", ".htm", ".xlsx", ".pptx"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
+
+ProgressNote = Callable[[str], None]
 
 
-def parse_document(path: Path) -> list[SectionDraft]:
+@dataclass
+class ParseOutcome:
+    sections: list[SectionDraft]
+    ocr_meta: str
+
+
+def _empty_outcome(sections: list[SectionDraft]) -> ParseOutcome:
+    return ParseOutcome(sections=sections, ocr_meta="")
+
+
+def _content_hash(path: Path, raw_content_hash: str | None) -> str:
+    if raw_content_hash:
+        return raw_content_hash
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def parse_document(
+    path: Path,
+    *,
+    raw_content_hash: str | None = None,
+    progress_note: ProgressNote | None = None,
+) -> ParseOutcome:
     suffix = path.suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"暂不支持的文件格式：{suffix}")
     if suffix == ".md":
-        return parse_markdown(path)
+        return _empty_outcome(parse_markdown(path))
     if suffix == ".txt":
-        return build_sections_from_plain_text(path.read_text(encoding="utf-8"), path.stem)
+        return _empty_outcome(build_sections_from_plain_text(path.read_text(encoding="utf-8"), path.stem))
     if suffix == ".docx":
-        return parse_docx(path)
+        return _empty_outcome(parse_docx(path))
     if suffix == ".pdf":
-        return parse_pdf(path)
+        return parse_pdf(path, raw_content_hash=raw_content_hash, progress_note=progress_note)
     if suffix in (".html", ".htm"):
-        return parse_html_file(path)
+        return _empty_outcome(parse_html_file(path))
     if suffix == ".xlsx":
-        return parse_xlsx(path)
+        return _empty_outcome(parse_xlsx(path))
     if suffix == ".pptx":
-        return parse_pptx(path)
+        return _empty_outcome(parse_pptx(path))
+    if suffix in IMAGE_SUFFIXES:
+        return parse_image(path, raw_content_hash=_content_hash(path, raw_content_hash), progress_note=progress_note)
     raise ValueError(f"暂不支持的文件格式：{suffix}")
 
 
@@ -167,17 +215,92 @@ def parse_pptx(path: Path) -> list[SectionDraft]:
     return sections
 
 
-def parse_pdf(path: Path) -> list[SectionDraft]:
+def parse_image(
+    path: Path,
+    *,
+    raw_content_hash: str,
+    progress_note: ProgressNote | None = None,
+) -> ParseOutcome:
+    from app.services.ocr_engine import ocr_image_path
+
+    text, meta = ocr_image_path(path, raw_content_hash=raw_content_hash, progress=progress_note)
+    text = normalize_text(text)
+    if not text.strip():
+        raise ValueError("OCR 未从图片中识别到文本，请检查语言包或图像清晰度")
+    sections = build_sections_from_plain_text(text, path.stem)
+    return ParseOutcome(sections=sections, ocr_meta=json.dumps(meta, ensure_ascii=False))
+
+
+def parse_pdf(
+    path: Path,
+    *,
+    raw_content_hash: str | None = None,
+    progress_note: ProgressNote | None = None,
+) -> ParseOutcome:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
         raise RuntimeError("解析 PDF 需要安装 pypdf") from exc
 
     reader = PdfReader(str(path))
-    page_texts = []
+    page_texts: list[str] = []
     for page in reader.pages:
         page_texts.append(page.extract_text() or "")
     text = normalize_text("\n\n".join(page_texts))
-    if not text:
-        raise ValueError("PDF 未提取到文本，可能是扫描件；OCR 将在后续阶段支持")
-    return build_sections_from_plain_text(text, path.stem)
+    settings = get_settings()
+    threshold = max(0, settings.ocr_pdf_min_text_chars)
+
+    def _cjk_ratio(s: str) -> float:
+        compact = "".join(s.split())
+        if not compact:
+            return 0.0
+        n = sum(1 for ch in compact if "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf")
+        return n / len(compact)
+
+    long_enough = len(text.strip()) >= threshold and bool(text.strip())
+    min_cjk = float(settings.ocr_pdf_min_cjk_ratio or 0.0)
+    suspicious_layer = long_enough and min_cjk > 0.0 and _cjk_ratio(text) < min_cjk
+
+    use_text_layer = (
+        not settings.ocr_pdf_force_visual
+        and long_enough
+        and not suspicious_layer
+    )
+
+    if use_text_layer:
+        return _empty_outcome(build_sections_from_plain_text(text, path.stem))
+
+    if suspicious_layer and not settings.ocr_enabled:
+        raise ValueError(
+            "PDF 文字层字符数足够，但汉字占比过低，疑似编码/字体映射异常（常见于部分国标电子版）。"
+            "请在 .env 开启 OCR_ENABLED=true，或设置 OCR_PDF_FORCE_VISUAL=true 强制按页渲染识别。"
+        )
+
+    if not settings.ocr_enabled:
+        if settings.ocr_pdf_force_visual:
+            raise ValueError(
+                "已设置 OCR_PDF_FORCE_VISUAL=true，须同时 OCR_ENABLED=true，并安装 uv sync --extra ocr 与本机 Tesseract。"
+            )
+        raise ValueError(
+            "PDF 未提取到足够文本（可能为扫描件）。请在 .env 设置 OCR_ENABLED=true，"
+            "执行 uv sync --extra ocr，并安装本机 Tesseract 与语言包。"
+        )
+
+    from app.services.ocr_engine import ocr_pdf_scanned
+
+    h = _content_hash(path, raw_content_hash)
+    text2, meta = ocr_pdf_scanned(path, raw_content_hash=h, progress=progress_note)
+    text2 = normalize_text(text2)
+    if not text2.strip():
+        raise ValueError("OCR 未从 PDF 中识别到文本，请检查语言包或提高 OCR_PDF_DPI")
+    sections = build_sections_from_plain_text(text2, path.stem)
+    payload = {
+        **meta,
+        "source": "pdf_scan",
+        "text_layer_chars": len(text.strip()),
+        "threshold": threshold,
+        "used_text_layer": False,
+        "force_visual": settings.ocr_pdf_force_visual,
+        "suspicious_text_layer": suspicious_layer,
+    }
+    return ParseOutcome(sections=sections, ocr_meta=json.dumps(payload, ensure_ascii=False))

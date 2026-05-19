@@ -41,10 +41,11 @@ CREATE TABLE IF NOT EXISTS documents (
     source_path TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     content_fingerprint TEXT NOT NULL DEFAULT '',
-    summary TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
-);
+            summary TEXT NOT NULL DEFAULT '',
+            ocr_meta TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
 
 CREATE TABLE IF NOT EXISTS sections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,6 +148,8 @@ def init_db() -> None:
         _migrate_embeddings_table(conn)
         _migrate_documents_content_fingerprint(conn)
         migrate_entity_fts(conn)
+        _migrate_p2_tables(conn)
+        _migrate_documents_ocr_meta(conn)
         _repair_legacy_document_foreign_keys(conn)
         conn.executescript(INDEXES)
         violations = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -191,6 +194,54 @@ def _migrate_documents_content_fingerprint(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_documents_ocr_meta(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    if "ocr_meta" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN ocr_meta TEXT NOT NULL DEFAULT ''")
+
+
+def _migrate_p2_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            UNIQUE(project_id, name)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_tags (
+            document_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL,
+            PRIMARY KEY (document_id, tag_id),
+            FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE,
+            FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(project_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_document_tags_document ON document_tags(document_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_document_tags_tag ON document_tags(tag_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_project ON chat_messages(project_id, id)")
+
+
 def _has_global_content_hash_unique(conn: sqlite3.Connection) -> bool:
     indexes = conn.execute("PRAGMA index_list(documents)").fetchall()
     for index in indexes:
@@ -219,6 +270,7 @@ def _rebuild_documents_table(conn: sqlite3.Connection, has_project_id: bool) -> 
             content_hash TEXT NOT NULL,
             content_fingerprint TEXT NOT NULL DEFAULT '',
             summary TEXT NOT NULL DEFAULT '',
+            ocr_meta TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
         )
@@ -226,8 +278,8 @@ def _rebuild_documents_table(conn: sqlite3.Connection, has_project_id: bool) -> 
     )
     conn.execute(
         f"""
-        INSERT INTO documents(id, project_id, filename, file_type, source_path, content_hash, content_fingerprint, summary, created_at)
-        SELECT id, {project_expression}, filename, file_type, source_path, content_hash, content_hash, summary, created_at
+        INSERT INTO documents(id, project_id, filename, file_type, source_path, content_hash, content_fingerprint, summary, created_at, ocr_meta)
+        SELECT id, {project_expression}, filename, file_type, source_path, content_hash, content_hash, summary, created_at, ''
         FROM documents_old
         """
     )

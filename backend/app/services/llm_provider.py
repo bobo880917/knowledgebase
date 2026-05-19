@@ -22,7 +22,12 @@ class LLMProvider:
         except Exception as exc:
             return ProviderHealth(configured=True, ok=False, message=f"LLM Provider 不可访问：{exc}")
 
-    async def answer(self, query: str, hits: list[SearchHit]) -> str:
+    async def answer(
+        self,
+        query: str,
+        hits: list[SearchHit],
+        conversation_context: str | None = None,
+    ) -> str:
         context = self._build_context(hits)
         system_prompt = (
             "你是本地知识库问答助手。你只能使用下方「检索上下文」中的内容作答，禁止编造事实或使用上下文外的知识。"
@@ -30,7 +35,14 @@ class LLMProvider:
             "回答要点须标注引用编号，格式为 [1][2] 对应上下文条目序号。"
             "引用编号只能来自检索上下文已给出的序号，不得虚构。"
         )
-        user_prompt = f"用户问题：{query}\n\n检索上下文（条目序号即引用编号）：\n{context}"
+        extra = ""
+        if conversation_context and conversation_context.strip():
+            extra = (
+                "\n\n以下为同一项目内的近期对话摘要，仅用于理解指代与追问意图；"
+                "事实与结论仍必须仅来自「检索上下文」，不得把对话内容当作知识库依据。\n"
+                f"{conversation_context.strip()}"
+            )
+        user_prompt = f"用户问题：{query}{extra}\n\n检索上下文（条目序号即引用编号）：\n{context}"
         payload = {
             "model": self.settings.llm_model,
             "messages": [
